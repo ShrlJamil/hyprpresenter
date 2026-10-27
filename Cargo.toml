@@ -1,0 +1,27 @@
+[package]
+name = "hyprpresenter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "Presentation remote for Hyprland: Android-controlled slides and laser pointer"
+repository = "https://github.com/ShrlJamil/hyprpresenter"
+readme = "README.md"
+keywords = ["hyprland", "wayland", "presentation", "laser-pointer", "overlay"]
+categories = ["command-line-utilities", "gui"]
+
+[dependencies]
+# Hyprland's IPC socket replies are JSON; serde is the standard, zero-cost
+# way to deserialize them into typed structs.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Small, zero-runtime derive macro for the project's single error type.
+thiserror = "2"
+# Wayland client protocol bindings. Used by the `probe` subcommand to confirm
+# which compositor protocols (layer-shell, virtual-pointer, fractional scale)
+# are actually available, and will be the base for the overlay in later phases.
+wayland-client = "0.31"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

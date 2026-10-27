@@ -1,0 +1,7 @@
+/target
+Cargo.lock.bak
+
+# Local editor/tooling artifacts
+.idea/
+.vscode/
+*.swp
