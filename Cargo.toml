@@ -15,12 +15,20 @@ categories = ["command-line-utilities", "gui"]
 # way to deserialize them into typed structs.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Registry/output handling plus wlr-layer-shell and wl_shm boilerplate for the
+# overlay. Default features already include calloop, which drives the event
+# loop together with the control socket.
+smithay-client-toolkit = "0.19"
 # Small, zero-runtime derive macro for the project's single error type.
 thiserror = "2"
-# Wayland client protocol bindings. Used by the `probe` subcommand to confirm
-# which compositor protocols (layer-shell, virtual-pointer, fractional scale)
-# are actually available, and will be the base for the overlay in later phases.
+# Use the system libwayland client backend rather than the pure-Rust fallback.
+wayland-backend = { version = "0.3.17", features = ["client_system"] }
+# Wayland client bindings. The probe enumerates compositor globals; the overlay
+# uses the same connection for layer-shell and shared-memory rendering.
 wayland-client = "0.31"
+# Stable/staging protocol bindings used by the probe and the overlay's
+# fractional-scale (wp_fractional_scale_v1) + viewporter path.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 [profile.release]
 lto = "thin"

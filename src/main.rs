@@ -1,16 +1,19 @@
-//! `hyprpresenter` — presentation remote for Hyprland (desktop component).
+//! Transparent click-through laser overlay on Hyprland's `overlay` layer.
 //!
-//! Current status (Phase 3): an inspectable, verifiable foundation.
-//!   * `hyprpresenter status` — health check: who am I running under, which
-//!     Hyprland instance, which outputs.
-//!   * `hyprpresenter probe`  — Wayland protocol discovery: can this
-//!     compositor host a layer-shell overlay and a virtual pointer?
+//! A small shared-memory surface renders a red dot at a controllable position.
+//! The surface uses:
+//! - `zwlr_layer_shell_v1` with `Layer::Overlay`, `KeyboardInteractivity::None`
+//! - an empty input region (pointer passthrough)
+//! - `wl_shm` for software rendering (no GPU dependency)
 //!
-//! Networking, pairing, slide control, and the laser overlay itself are
-//! deliberately NOT implemented yet (see README.md).
+//! Test control is via a small local UNIX socket so no networking is needed in
+//! this phase.  The socket handler feeds the same command values the future
+//! WebSocket command handler will use, so it can be replaced without touching
+//! the rendering code.
 
 mod error;
 mod hyprland;
+mod overlay;
 mod wayland_probe;
 
 use std::process::ExitCode;
@@ -32,13 +35,15 @@ fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("status") => cmd_status(),
         Some("probe") => cmd_probe(),
+        Some("overlay") => {
+            let rest = &args[1..];
+            overlay::run(rest)
+        }
         Some("--version") | Some("-V") => {
             println!("hyprpresenter {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(other) => Err(Error::HyprlandReply(format!(
-            "unknown command `{other}` (expected `status`, `probe`, or `--version`)"
-        ))),
+        Some(other) => Err(Error::UnknownCommand(other.to_string())),
         None => {
             print_usage();
             Ok(())
@@ -51,11 +56,12 @@ fn print_usage() {
         "hyprpresenter {} — presentation remote for Hyprland
 
 USAGE:
-  hyprpresenter status     health check: Hyprland session, version, monitors
-  hyprpresenter probe      check which Wayland protocols the compositor offers
-  hyprpresenter --version  print version
+  hyprpresenter status       health check: Hyprland session, version, monitors
+  hyprpresenter probe        check which Wayland protocols the compositor offers
+  hyprpresenter overlay      run the laser overlay (`overlay --help` for controls)
+  hyprpresenter --version    print version
 
-The overlay, phone remote, and slide control are not implemented yet —
+The phone remote, slide control, and networking are not implemented yet —\
 see README.md for the planned architecture.",
         env!("CARGO_PKG_VERSION")
     );

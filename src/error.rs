@@ -27,9 +27,17 @@ pub enum Error {
     #[error("I/O error on the Hyprland IPC socket: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Errors surfaced by the Wayland connection (probe / future overlay).
+    /// Errors surfaced by the Wayland connection (probe / overlay).
     #[error("Wayland error: {0}")]
     Wayland(String),
+
+    /// Overlay setup, control-channel, or rendering failure.
+    #[error("overlay error: {0}")]
+    Overlay(String),
+
+    /// Unrecognised CLI subcommand.
+    #[error("unknown command `{0}` (expected `status`, `probe`, `overlay`, or `--version`)")]
+    UnknownCommand(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -42,8 +50,10 @@ impl Error {
             Error::NoHyprlandSignature => 2,
             Error::HyprlandSocket { .. } | Error::Io(_) => 3,
             Error::HyprlandReply(_) => 4,
+            Error::UnknownCommand(_) => 4,
             Error::InvalidJson(_) => 5,
             Error::Wayland(_) => 6,
+            Error::Overlay(_) => 7,
         }
     }
 }
