@@ -25,13 +25,25 @@ built into the pad's header.
 
 ## Setup
 
-### 1. Build and run the desktop overlay
+### 1. Install and run the desktop overlay
 
 ```sh
 git clone https://github.com/ShrlJamil/hyprpresenter
 cd hyprpresenter
-cargo build --release        # or plain `cargo build` for a debug build
-./target/release/hypresent overlay
+./install.sh
+```
+
+The installer builds the release binary and symlinks it into
+`~/.local/bin`, so from then on `hypresent` works from any terminal. If
+Rust is missing it offers to install it via rustup — you never need to
+know Rust yourself; it is only the build tool. (Manual equivalent:
+`cargo build --release`, then link or copy `target/release/hypresent`
+somewhere on your PATH.)
+
+Then start the overlay:
+
+```sh
+hypresent overlay
 ```
 
 The overlay draws on every monitor, starts its WebSocket server on port
@@ -44,7 +56,7 @@ called `hypresent`; the project, repository, and config paths keep the
 In another terminal:
 
 ```sh
-./target/release/hypresent pair
+hypresent pair
 ```
 
 This prints a QR code in the terminal and stores the pairing token — only
