@@ -126,16 +126,37 @@ class GyroPointer {
     _lastGyroAt = null;
   }
 
-  /// Orientation deviation from the anchor, as rotation-vector components
-  /// in the anchor frame: `pitch` = rotation about the anchor's X axis
-  /// (nodding the phone) and `yaw` = rotation about the anchor's Y axis
-  /// (swinging the phone sideways).  Null before the first [anchor].
+  /// Orientation deviation from the anchor, as the deflection of the
+  /// phone's top edge (device +Y, the "barrel" you aim with) from its
+  /// anchored direction, decomposed in the anchor frame:
+  /// `yaw` = deflection toward the anchor's X axis (leaning/aiming the
+  /// top edge sideways — the natural horizontal steering motion, mostly
+  /// roll), `pitch` = deflection toward the anchor's Z axis (nodding the
+  /// top edge toward/away).  Both are atan2 angles in radians.
+  ///
+  /// This replaced a rotation-vector decomposition after on-device
+  /// trials: reading only the rotation vector's X/Y components made
+  /// horizontal steering feel walled-in around the centre, because the
+  /// hand steers sideways mostly by rolling the phone (rotation about
+  /// Z), which that decomposition throws away.  The barrel deflection
+  /// captures pitch and roll aiming alike; spinning the phone about its
+  /// own long axis correctly steers nothing.
   ({double pitch, double yaw})? get deviation {
     final anchor = _anchor;
     if (anchor == null) return null;
-    final dq = anchor.conjugate * _q;
-    final v = dq.rotationVector;
-    return (pitch: v.x, yaw: v.y);
+    final d = _q.rotate(0, 1, 0);
+    final d0 = anchor.rotate(0, 1, 0);
+    final r0 = anchor.rotate(1, 0, 0);
+    final s0 = anchor.rotate(0, 0, 1);
+    double dot(
+      ({double x, double y, double z}) a,
+      ({double x, double y, double z}) b,
+    ) => a.x * b.x + a.y * b.y + a.z * b.z;
+    final forward = dot(d, d0);
+    return (
+      pitch: math.atan2(dot(d, s0), forward),
+      yaw: math.atan2(dot(d, r0), forward),
+    );
   }
 
   /// The estimated "up" direction in the device frame (test/debug aid).

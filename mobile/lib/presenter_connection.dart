@@ -98,18 +98,31 @@ class PresenterConnection extends ChangeNotifier {
     _sendRaw({'v': 1, ...fields});
   }
 
-  void next() => sendCommand({'cmd': 'next'});
-  void previous() => sendCommand({'cmd': 'previous'});
-  void center() => sendCommand({'cmd': 'center'});
-  void show() => sendCommand({'cmd': 'show'});
-  void hide() => sendCommand({'cmd': 'hide'});
-  void status() => sendCommand({'cmd': 'status'});
+  /// Fire-and-forget for commands the server answers: the reply is
+  /// still expected (and consumed, in order) — it is just not awaited
+  /// here.  Registering every answered command keeps the reply FIFO
+  /// aligned: a reply can never land in the wrong caller's hands.
+  void _fire(Map<String, dynamic> fields) {
+    requestReply(fields).ignore();
+  }
+
+  void next() => _fire({'cmd': 'next'});
+  void previous() => _fire({'cmd': 'previous'});
+  void center() => _fire({'cmd': 'center'});
+  void show() => _fire({'cmd': 'show'});
+  void hide() => _fire({'cmd': 'hide'});
+  void status() => _fire({'cmd': 'status'});
+
+  /// Laser moves are the one unanswered command: they stream at ~50/s
+  /// and the server applies them without a reply (see net.rs), so no
+  /// reply slot is registered for them either.
   void moveTo(int x, int y) => sendCommand({'cmd': 'move', 'x': x, 'y': y});
 
   final List<Completer<String>> _pendingReplies = [];
 
   /// Send a command and await its reply text.  The server answers every
-  /// command exactly once, in order, so a FIFO of completers matches
+  /// command except streaming laser moves exactly once, in order, and
+  /// every answered send registers here, so a FIFO of completers matches
   /// replies to requests.
   Future<String> requestReply(Map<String, dynamic> fields) {
     if (!isReady) {
@@ -137,7 +150,16 @@ class PresenterConnection extends ChangeNotifier {
   // -- internals --------------------------------------------------------------
 
   void _sendRaw(Map<String, dynamic> message) {
-    _socket?.add(jsonEncode(message));
+    try {
+      _socket?.add(jsonEncode(message));
+    } catch (e) {
+      // A dead socket must not throw into gesture handlers (the laser
+      // button sends from a pointer callback): flip the state to failed
+      // so the UI stops trusting the link and the user can reconnect.
+      if (state == LinkState.ready || state == LinkState.authenticating) {
+        _fail('connection lost: $e');
+      }
+    }
   }
 
   void _onMessage(dynamic data, Completer<bool> authResult) {

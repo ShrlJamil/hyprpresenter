@@ -7,52 +7,117 @@ no cloud, no mouse takeover, no persistent desktop GUI.
 Think of it as a physical presentation clicker that happens to live in your
 pocket and draw a laser dot on your screen instead of on the wall.
 
-## Status — Phase 6 in progress: Android app (6.2 built)
+## Preview
 
-The desktop foundation and the laser overlay work on every output at once,
-and a paired phone can drive them over the local network. The Flutter
-controller app lives in `mobile/`: QR-only pairing, the clicker, and the
-gyroscope laser (hold-to-activate, press-anchored pointing model) are
-built, and the app runs on a real phone. Monitor confinement — keeping the
-laser on one chosen output — is implemented on both sides.
+<img src="docs/preview-clicker.jpg" alt="The HyprPresenter phone app: slide notes on top, Previous/Next in the middle, and the laser pad with its monitor selector below" width="320">
 
-Implemented:
+The phone app: per-slide presenter notes on top, Previous/Next in the
+middle, and the hold-to-aim laser pad below, with the monitor selector
+built into the pad's header.
 
-- `hypresent status` — verifies it is running inside a Hyprland session,
-  reports the compositor version and all monitors (geometry, focus, active).
-- `hypresent probe` — connects to the Wayland display and reports which
-  protocols the compositor actually advertises.
-- `hypresent overlay` — transparent, click-through layer-shell surfaces,
-  one per output, rendering a laser dot through `wl_shm`. The dot position
-  is a **global logical coordinate** across all outputs (layout from
-  Hyprland IPC `j/monitors`); each surface converts it to its own local
-  pixels. Position, visibility, radius, color, and shutdown are controlled
-  through a temporary local UNIX socket. `--output NAME` still restricts
-  drawing to a single output.
-- A transport-agnostic **command core** (`src/command.rs`): `Command`,
-  `Appearance`, colour/radius validation, layout geometry, and all state
-  transitions live in one pure module with unit tests. The socket handler
-  is a thin adapter over it; the WebSocket handler is another.
-- `previous`/`next` inject PageUp/PageDown into the focused application
-  through the virtual-keyboard protocol. The evdev keycode mapping is
-  configurable in one place (`--previous-key` / `--next-key`).
-- A **LAN WebSocket server** (`src/net.rs`) inside the overlay process
-  (default port 8423, `--ws-port` / `--no-ws`): one authenticated client at
-  a time sends JSON commands that map 1:1 onto the command core and gets
-  the core's replies back in a JSON envelope. Authentication is a pairing
-  token provisioned by `hypresent pair`; only its SHA-256 hash is
-  stored (mode 0600). See "Phone protocol (WebSocket, v1)" below.
+## What you need
 
-Not implemented yet (by design):
+- A Linux machine running [Hyprland](https://hypr.land) (tested on
+  0.57.1) — it hosts the laser overlay and receives the phone's commands.
+- An Android phone on the **same local network** as the machine.
+- To build from source: Rust 1.80+ for the desktop program, Flutter 3.x
+  with the Android SDK for the app.
 
-- App polish (Phase 6.3): auto-reconnect, wake lock, app icon
-- Configuration file, packaging, systemd unit
+## Setup
 
-## Prerequisites
+### 1. Build and run the desktop overlay
 
-- Linux with [Hyprland](https://hypr.land) running (tested on 0.57.1)
-- Rust 1.80+ (edition 2021; no nightly features used)
-- For `probe` only: a working Wayland connection (`WAYLAND_DISPLAY` set)
+```sh
+git clone https://github.com/ShrlJamil/hyprpresenter
+cd hyprpresenter
+cargo build --release        # or plain `cargo build` for a debug build
+./target/release/hypresent overlay
+```
+
+The overlay draws on every monitor, starts its WebSocket server on port
+**8423**, and waits for a paired phone. Leave it running. (The binary is
+called `hypresent`; the project, repository, and config paths keep the
+`hyprpresenter` name.)
+
+### 2. Pair the phone
+
+In another terminal:
+
+```sh
+./target/release/hypresent pair
+```
+
+This prints a QR code in the terminal and stores the pairing token — only
+its SHA-256 hash is kept, at `~/.config/hyprpresenter/pairing.sha256`
+(mode 0600). **Re-running `pair` rotates the token**: previously paired
+phones stop working immediately and must scan the new code.
+
+### 3. Build and install the Android app
+
+```sh
+cd mobile
+flutter build apk --release --split-per-abi
+adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+```
+
+Install the `arm64-v8a` build on any modern phone (about 24 MB); copying
+the APK over and opening it on the phone works just as well. Release
+builds are currently signed with the debug key — fine for installing on
+your own phone, not a distribution build.
+
+### 4. Connect
+
+Open the app and tap **Scan QR**, then point the camera at the terminal
+QR code from step 2. That is the whole pairing flow — nothing to type.
+The app remembers the pairing and reconnects automatically on later
+launches.
+
+## Using it
+
+- **Slides** — *Previous* / *Next* send PageUp/PageDown to the focused
+  application on the desktop.
+- **Laser** — press and hold the big pad: the dot appears at the centre
+  of the active monitor and follows where you aim the **top edge of the
+  phone** (lean it left/right, nod it up/down). Release hides the dot;
+  every new hold re-anchors at the centre.
+- **Multiple monitors** — the dropdown in the laser pad's header pins
+  the laser to one output; the desktop enforces the confinement, so the
+  dot cannot leak onto the other screen. *All screens* releases it.
+- **Slide notes** — the notes button on the start screen (or the pencil
+  button in the clicker's notes area) opens a notebook-style editor:
+  one cell per slide, the wide **+** tile adds a slide, and everything
+  auto-saves on the phone as you type. During the talk, the clicker's
+  notes area shows the note for the current slide and follows
+  Previous/Next; the small chevrons next to the counter re-sync the
+  slide number by hand if you changed slides some other way.
+
+Notes can also live in a plain Markdown file — written on the desktop,
+opened from the editor or the clicker, and exported back out in the same
+format:
+
+```markdown
+## 1
+Opening: state the problem first, then the demo.
+
+## 2
+Point at the diagram; latency numbers are on this one.
+```
+
+One `## N` heading per slide (an empty note is fine — the number keeps
+every later note in place). The parser is forgiving: `## Slide 1`
+headings and `---` separators are accepted too.
+
+## Status
+
+Working today, and verified on real hardware (dual-monitor Hyprland
+session, physical phone): the multi-output laser overlay, the
+transport-agnostic command core, token pairing over WebSocket, the
+clicker, the gyroscope laser (direction and sensitivity calibrated
+on-device), monitor confinement, the slide-notes editor, and the app's
+green UI with its own launcher icon.
+
+Deliberately not there yet: auto-reconnect and wake lock in the app, a
+desktop configuration file, packaging, and a systemd unit.
 
 ## Development
 
@@ -478,7 +543,7 @@ starve the real client's handshake in the TCP backlog — so any session
 with **no traffic at all for 120 s (pings count as traffic) is
 evicted**.
 
-### Phase 6 (in progress) — Android app
+### Phase 6 — Android app
 
 The app lives in `mobile/` in this same repository (one repo on purpose:
 the protocol is a shared contract and both sides still change together;
@@ -486,44 +551,51 @@ the protocol is a shared contract and both sides still change together;
 life). Flutter, package `com.sahruljamil.hyprpresenter_mobile`, speaking
 protocol v1 over `dart:io` WebSocket — no networking dependency.
 
-- **6.1 (built, running on a real phone):** pairing is **QR-only** — the
-  start screen is a single Scan QR button (the desktop's `pair` QR fills
-  everything in); the paired values persist and later launches reconnect
-  automatically. Clicker screen: PREV/NEXT buttons and disconnect. A 5 s
-  client ping interval keeps the session inside the server's ping/pong
-  handling. The manual host/port/token form from the first build was
-  removed in 6.2 by design decision (QR or nothing).
-- **6.2 (built):** the gyroscope laser. One dominant hold button fills
-  most of the clicker: press-and-hold shows the laser **at the centre of
-  the active area** and anchors the phone's orientation; while held, the
-  dot follows the orientation *deviation* from that anchor (a pointing
-  model — return the phone to its starting pose and the dot returns to
-  the centre); release hides the laser and the next press re-anchors.
-  Orientation uses a complementary filter (gyro integration corrected by
-  the accelerometer's gravity direction, `lib/gyro_pointer.dart`, unit
-  tested with synthetic rotations). Moves stream at ~30/s, smoothed and
-  clamped to the active area. On multi-monitor setups a monitor picker
-  appears (from the `areas=` status field); the app confines the laser
-  to the chosen output — defaulting to the one the dot is on — and the
-  **desktop enforces the clamp** via the `confine` command, so the dot
-  physically cannot leak onto the other screen. There is no Show/Hide
-  button: the hold button *is* the laser switch.
-- **6.3:** polish — auto-reconnect, wake lock during a session, app icon.
+- **Pairing (6.1)** is **QR-only**: the start screen is one Scan QR
+  button (plus reconnect for a stored pairing); the desktop's `pair` QR
+  carries host, port, and token. The values persist and later launches
+  reconnect automatically. There is deliberately no manual form.
+- **Gyroscope laser (6.2):** one dominant hold pad fills the clicker.
+  Press-and-hold shows the laser at the centre of the active area and
+  anchors the phone's orientation; while held, the dot follows the
+  **deflection of the phone's top edge** from that anchor — the barrel
+  you actually aim with. (The first build decomposed the rotation
+  vector instead; that threw away roll, which is how a hand steers
+  sideways, and horizontal movement felt walled-in around the centre.
+  The deflection model steers naturally in every direction and was
+  confirmed on-device.) A complementary filter (gyro integration
+  corrected by the accelerometer's gravity direction, integrated with
+  the sensors' own timestamps) feeds it in `lib/gyro_pointer.dart`.
+  Moves stream at ~50/s and are **fire-and-forget** on the WebSocket —
+  no reply is awaited, because a synchronous round trip per move made
+  the server process a stale queue one point at a time (visible
+  stepping); the event loop renders only the newest position.
+  Sensitivity is one constant (0.67 rad sweeps the full area), tuned in
+  the hand. On multi-monitor setups the pad's header carries a monitor
+  dropdown and the **desktop enforces the clamp** via the `confine`
+  command; the default is the output the dot is on. There is no
+  Show/Hide button: the hold pad *is* the laser switch, and releasing
+  it hides the dot.
+- **Slide notes:** a notebook-style editor (one cell per slide, a wide
+  **+** tile to add, autosave on every keystroke) reachable from the
+  start screen and from the clicker's notes area. Notes persist on the
+  phone as a Markdown file in the app's documents directory — the same
+  `## N` format the app opens and exports through the system file
+  dialogs, so notes prepared on the desktop and notes typed on the
+  phone are interchangeable. The clicker counts slides from its own
+  Previous/Next presses and shows the matching note; chevrons next to
+  the counter correct the number manually.
+- **Presentation:** all-English UI on a green Material You theme, a
+  custom launcher icon (adaptive + legacy), rotation locked to
+  portrait. The app is built per-ABI with obfuscation; the arm64
+  release is 23.4 MiB.
 
-Phase 6 verification so far: confinement is proven live on the real
-dual-monitor session (confine to DP-1, then `move 0 600` toward the other
-monitor lands at `dot=1292,600` — the DP-1 edge inset by the dot radius;
-`center` retargets to that output's centre; release restores free
-movement; unknown outputs get a named error). 23 Rust tests and 9 Flutter
-tests pass (gyro integration, gravity-filter convergence, status parsing,
-QR-only first launch), `flutter analyze` and clippy are clean, and release
-APKs build (63.7 MB fat, 23.7 MB arm64). Still open: the on-device gyro
-feel — direction signs live in two calibration constants in
-`ClickerPage` (`_yawSign`/`_pitchSign`) in case a direction feels
-inverted in the hand, and the QR pairing flow end-to-end on the phone.
-
-Configuration file, packaging (release signing, split APKs), and a
-systemd unit remain later phases.
+Verification: 23 Rust tests and 15 Flutter tests pass (command core,
+gyro model, gravity convergence, status parsing, notes format
+round-trip), `flutter analyze` and clippy are clean, and the whole
+flow — QR pairing, clicker, gyro laser, confinement — is exercised on
+the author's real phone against the real dual-monitor session. Still
+open (Phase 6.3): auto-reconnect and a wake lock for long sessions.
 
 ## License
 
