@@ -1,23 +1,26 @@
-//! Minimal transparent, click-through laser overlay.
+//! Transparent, click-through laser overlay on every output (Phase 4).
 //!
-//! The overlay is a single `wlr-layer-shell` surface on the `Overlay` layer,
-//! sized to the whole target output.  It is intentionally simple:
+//! The overlay creates one `wlr-layer-shell` surface per `wl_output`, each
+//! sized to its whole output:
 //!
 //! * `KeyboardInteractivity::None` (never take keyboard focus)
 //! * an explicitly empty input region (pointer events pass through)
-//! * one `wl_shm` ARGB8888 buffer, redrawn on demand
+//! * one `wl_shm` ARGB8888 buffer per surface, redrawn on demand, with an
+//!   independent lifecycle per surface so one slow output cannot stall the
+//!   others
 //! * `wp_fractional_scale_v1` + `wp_viewport` when available, so a 1.25x
 //!   output is rendered at full physical resolution instead of being
 //!   stretched from logical pixels
 //!
-//! Coordinates accepted by the test controls are **output-local logical
-//! pixels**.  The selected output's logical size is whatever the compositor
-//! reports in the layer-shell configure event (1536x960 on a 1920x1200 @ 1.25
-//! output), not the physical mode size.
+//! The dot position lives in the transport-agnostic core (`command.rs`) in
+//! **global logical coordinates**: the union layout comes from Hyprland IPC
+//! (`j/monitors`), and each surface converts the global point into its own
+//! local coordinates when drawing.  A surface whose output does not contain
+//! the dot draws a fully transparent frame.
 //!
 //! Test control is deliberately a tiny, removable local UNIX socket.  The
-//! future network layer only has to feed [`Command`] values into the same
-//! handler.
+//! socket handler is a thin adapter over the command core; the WebSocket
+//! network layer only has to feed the same [`Command`] values into it.
 
 use std::{
     fs,
@@ -65,20 +68,25 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
-    Connection, Dispatch, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols::wp::{
     fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     viewporter::client::{wp_viewport, wp_viewporter},
 };
 
-use crate::error::{Error, Result};
+use crate::{
+    command::{
+        parse_color, parse_command, parse_radius, Action, Appearance, Command, LaserState, Layout,
+        OutputRect,
+    },
+    error::{Error, Result},
+    hyprland,
+    input::{Input, NavKeys, PresentationKey},
+};
 
-/// Default output to draw on.  Override with `--output NAME`.
-const DEFAULT_OUTPUT: &str = "eDP-1";
-/// Default dot radius in logical pixels.
-const DEFAULT_RADIUS: i32 = 12;
-/// Environment override, mainly for automated tests and side-by-side runs.
+/// Environment override for the control socket, mainly for automated tests
+/// and side-by-side runs.
 const SOCKET_ENV: &str = "HYPRPRESENTER_SOCKET";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -87,9 +95,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("run") => run_overlay(Options::parse(&args[1..])?),
         Some("move") => {
             if args.len() != 3 {
-                return Err(Error::Overlay(
-                    "usage: hyprpresenter overlay move X Y".into(),
-                ));
+                return Err(Error::Overlay("usage: hypresent overlay move X Y".into()));
             }
             let x = parse_i32("X", &args[1])?;
             let y = parse_i32("Y", &args[2])?;
@@ -98,6 +104,32 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("center") => send_control("center"),
         Some("show") => send_control("show"),
         Some("hide") => send_control("hide"),
+        Some("radius") => {
+            if args.len() != 2 {
+                return Err(Error::Overlay("usage: hypresent overlay radius N".into()));
+            }
+            let radius = parse_radius(&args[1]).map_err(Error::Overlay)?;
+            send_control(&format!("radius {radius}"))
+        }
+        Some("color") => {
+            if args.len() != 2 {
+                return Err(Error::Overlay(
+                    "usage: hypresent overlay color NAME|#RRGGBB".into(),
+                ));
+            }
+            let color = parse_color(&args[1]).map_err(Error::Overlay)?;
+            send_control(&format!("color {}", color.to_hex()))
+        }
+        Some("previous") | Some("prev") => send_control("previous"),
+        Some("next") => send_control("next"),
+        Some("confine") => {
+            if args.len() != 2 {
+                return Err(Error::Overlay(
+                    "usage: hypresent overlay confine OUTPUT|off".into(),
+                ));
+            }
+            send_control(&format!("confine {}", args[1]))
+        }
         Some("status") => send_control("status"),
         Some("quit") => send_control("quit"),
         Some("-h") | Some("--help") => {
@@ -106,52 +138,78 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         Some(first) if first.starts_with('-') => run_overlay(Options::parse(args)?),
         Some(other) => Err(Error::Overlay(format!(
-            "unknown overlay action `{other}` (try `hyprpresenter overlay --help`)"
+            "unknown overlay action `{other}` (try `hypresent overlay --help`)"
         ))),
     }
 }
 
 fn print_help() {
     println!(
-        "hyprpresenter {} — laser overlay (proof of concept)
+        "hypresent {} — laser overlay
 
 USAGE:
-  hyprpresenter overlay [OPTIONS]     run the overlay (default: center of eDP-1)
-  hyprpresenter overlay status        report output, surface, buffer and dot state
-  hyprpresenter overlay move X Y      move the dot (output-local logical pixels)
-  hyprpresenter overlay center        move the dot back to the logical center
-  hyprpresenter overlay hide          render an empty (transparent) surface
-  hyprpresenter overlay show          draw the dot again
-  hyprpresenter overlay quit          shut the overlay down cleanly
+  hypresent overlay [OPTIONS]     run the overlay (all outputs)
+  hypresent overlay status        report outputs, layout, buffer and dot state
+  hypresent overlay move X Y      move the dot (global logical pixels)
+  hypresent overlay center        move the dot to the focused output's center
+  hypresent overlay hide          render empty (transparent) surfaces
+  hypresent overlay show          draw the dot again
+  hypresent overlay radius N      set dot radius, {}-{} logical pixels
+  hypresent overlay color C       set dot color (name or #RRGGBB)
+  hypresent overlay previous      send the previous key to the focused application
+  hypresent overlay next          send the next key to the focused application
+  hypresent overlay confine O|off keep the dot on output O (or release it)
+  hypresent overlay quit          shut the overlay down cleanly
 
 OPTIONS:
-  --output NAME    select the wl_output (default: {DEFAULT_OUTPUT})
-  --x N --y N      initial dot position in output-local logical pixels
-  --radius N       dot radius in logical pixels (default: {DEFAULT_RADIUS})
-  -h, --help       show this help
+  --output NAME      draw only on this wl_output (default: every output)
+  --x N --y N        initial dot position in global logical pixels
+  --radius N         dot radius in logical pixels (default: {})
+  --color C          initial dot color (name or #RRGGBB, default: red)
+  --previous-key N   evdev keycode for `previous` (default: 104, PageUp)
+  --next-key N       evdev keycode for `next` (default: 109, PageDown)
+  --ws-port N        WebSocket listen port for paired phones (default: 8423)
+  --no-ws            disable the WebSocket server (local socket only)
+  -h, --help         show this help
+
+Named colors: red, green, blue, yellow, cyan, magenta, white, orange.
+Hex colors are #RRGGBB; shell users must quote the leading `#`.
+
+Coordinates are global logical pixels across all outputs: the layout comes
+from Hyprland IPC (j/monitors) and each output's surface converts them to
+its own local pixels.  `status` reports which output the dot is on.
 
 The controls use a local UNIX socket in $XDG_RUNTIME_DIR (override with
 ${SOCKET_ENV}) and are intentionally temporary; they will be replaced by the
 network command handler in a later phase.",
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        crate::command::MIN_RADIUS,
+        crate::command::MAX_RADIUS,
+        crate::command::DEFAULT_RADIUS,
     );
 }
 
 #[derive(Debug, Clone)]
 struct Options {
-    output: String,
+    /// Restrict drawing to one output; `None` draws on every output.
+    output: Option<String>,
     x: Option<i32>,
     y: Option<i32>,
-    radius: i32,
+    appearance: Appearance,
+    nav_keys: NavKeys,
+    /// WebSocket listen port; `None` disables the network server.
+    ws_port: Option<u16>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            output: DEFAULT_OUTPUT.to_string(),
+            output: None,
             x: None,
             y: None,
-            radius: DEFAULT_RADIUS,
+            appearance: Appearance::default(),
+            nav_keys: NavKeys::default(),
+            ws_port: Some(crate::net::DEFAULT_WS_PORT),
         }
     }
 }
@@ -164,10 +222,11 @@ impl Options {
             match args[i].as_str() {
                 "--output" => {
                     i += 1;
-                    options.output = args
-                        .get(i)
-                        .ok_or_else(|| Error::Overlay("--output requires a name".into()))?
-                        .clone();
+                    options.output = Some(
+                        args.get(i)
+                            .ok_or_else(|| Error::Overlay("--output requires a name".into()))?
+                            .clone(),
+                    );
                 }
                 "--x" => {
                     i += 1;
@@ -187,15 +246,56 @@ impl Options {
                 }
                 "--radius" => {
                     i += 1;
-                    options.radius = parse_i32(
-                        "--radius",
+                    options.appearance.radius = parse_radius(
                         args.get(i)
                             .ok_or_else(|| Error::Overlay("--radius requires a value".into()))?,
+                    )
+                    .map_err(Error::Overlay)?;
+                }
+                "--color" => {
+                    i += 1;
+                    options.appearance.color = parse_color(
+                        args.get(i)
+                            .ok_or_else(|| Error::Overlay("--color requires a value".into()))?,
+                    )
+                    .map_err(Error::Overlay)?;
+                }
+                "--previous-key" => {
+                    i += 1;
+                    options.nav_keys.previous = parse_keycode(
+                        "--previous-key",
+                        args.get(i).ok_or_else(|| {
+                            Error::Overlay("--previous-key requires a value".into())
+                        })?,
                     )?;
+                }
+                "--next-key" => {
+                    i += 1;
+                    options.nav_keys.next = parse_keycode(
+                        "--next-key",
+                        args.get(i)
+                            .ok_or_else(|| Error::Overlay("--next-key requires a value".into()))?,
+                    )?;
+                }
+                "--ws-port" => {
+                    i += 1;
+                    let raw = args
+                        .get(i)
+                        .ok_or_else(|| Error::Overlay("--ws-port requires a value".into()))?;
+                    let port: u16 = raw.parse().map_err(|_| {
+                        Error::Overlay(format!("--ws-port must be a port number, got `{raw}`"))
+                    })?;
+                    if port == 0 {
+                        return Err(Error::Overlay("--ws-port must not be 0".into()));
+                    }
+                    options.ws_port = Some(port);
+                }
+                "--no-ws" => {
+                    options.ws_port = None;
                 }
                 other => {
                     return Err(Error::Overlay(format!(
-                        "unknown overlay option `{other}` (try `hyprpresenter overlay --help`)"
+                        "unknown overlay option `{other}` (try `hypresent overlay --help`)"
                     )))
                 }
             }
@@ -204,11 +304,6 @@ impl Options {
         if options.x.is_some() != options.y.is_some() {
             return Err(Error::Overlay(
                 "--x and --y must be supplied together".into(),
-            ));
-        }
-        if !(1..=500).contains(&options.radius) {
-            return Err(Error::Overlay(
-                "--radius must be between 1 and 500 logical pixels".into(),
             ));
         }
         Ok(options)
@@ -220,49 +315,21 @@ fn parse_i32(what: &str, raw: &str) -> Result<i32> {
         .map_err(|_| Error::Overlay(format!("{what} must be an integer, got `{raw}`")))
 }
 
-// ---------------------------------------------------------------------------
-// Local test control
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Command {
-    Move(i32, i32),
-    Center,
-    Show,
-    Hide,
-    Status,
-    Quit,
-}
-
-fn parse_command(raw: &str) -> std::result::Result<Command, String> {
-    let mut parts = raw.split_whitespace();
-    let command = match parts.next() {
-        Some("move") => {
-            let x = parts
-                .next()
-                .ok_or_else(|| "move requires X Y".to_string())?
-                .parse::<i32>()
-                .map_err(|_| "move X must be an integer".to_string())?;
-            let y = parts
-                .next()
-                .ok_or_else(|| "move requires X Y".to_string())?
-                .parse::<i32>()
-                .map_err(|_| "move Y must be an integer".to_string())?;
-            Command::Move(x, y)
-        }
-        Some("center") => Command::Center,
-        Some("show") => Command::Show,
-        Some("hide") => Command::Hide,
-        Some("status") => Command::Status,
-        Some("quit") | Some("exit") => Command::Quit,
-        Some(other) => return Err(format!("unknown command `{other}`")),
-        None => return Err("empty command".to_string()),
-    };
-    if parts.next().is_some() {
-        return Err("too many arguments".to_string());
+fn parse_keycode(what: &str, raw: &str) -> Result<u32> {
+    let code: u32 = raw
+        .parse()
+        .map_err(|_| Error::Overlay(format!("{what} must be an evdev keycode, got `{raw}`")))?;
+    if code == 0 {
+        return Err(Error::Overlay(format!(
+            "{what} must be a positive evdev keycode, got 0"
+        )));
     }
-    Ok(command)
+    Ok(code)
 }
+
+// ---------------------------------------------------------------------------
+// Local test control (thin adapter over the command core)
+// ---------------------------------------------------------------------------
 
 fn control_socket_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var(SOCKET_ENV) {
@@ -306,9 +373,12 @@ fn send_control(command: &str) -> Result<()> {
     Ok(())
 }
 
-struct ControlRequest {
-    command: Command,
-    reply: mpsc::Sender<String>,
+/// One parsed command plus the channel its reply goes to.  Shared by both
+/// transports: the local socket handler and the WebSocket server (`net.rs`)
+/// forward these into the event loop identically.
+pub(crate) struct ControlRequest {
+    pub(crate) command: Command,
+    pub(crate) reply: mpsc::Sender<String>,
 }
 
 /// Owns the control listener thread; dropping it stops the thread, wakes a
@@ -429,7 +499,7 @@ fn control_loop(
 }
 
 // ---------------------------------------------------------------------------
-// Wayland overlay
+// Wayland overlay (multi-surface)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +508,58 @@ enum ScaleMode {
     Fractional(u32),
     /// Integer buffer scale, no viewport.
     Integer(u32),
+}
+
+/// One output's layer surface plus its private buffer lifecycle.  Surfaces
+/// share only the immutable-per-frame inputs (layout + laser state); pools,
+/// buffers, and redraw flags are per surface, so a compositor that is slow
+/// to release one output's buffer never blocks another output's redraw.
+struct OutputSurface {
+    output: wl_output::WlOutput,
+    name: String,
+    layer: LayerSurface,
+    fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
+    viewport: Option<wp_viewport::WpViewport>,
+    pool: Option<SlotPool>,
+    /// The single `wl_shm` buffer, reused for every frame on this surface.
+    /// Reusing one slot keeps memory bounded; a redraw is deferred until
+    /// the compositor sends `wl_buffer.release` for the previous commit.
+    buffer: Option<Buffer>,
+    /// Logical size from the layer-shell configure event.
+    size: Option<(u32, u32)>,
+    buffer_size: Option<(u32, u32)>,
+    fractional_scale_120: Option<u32>,
+    integer_scale: i32,
+    configured: bool,
+    needs_redraw: bool,
+}
+
+impl OutputSurface {
+    fn scale_mode(&self) -> ScaleMode {
+        match (self.fractional_scale_120, self.viewport.as_ref()) {
+            (Some(scale_120), Some(_)) if scale_120 > 0 => ScaleMode::Fractional(scale_120),
+            _ => ScaleMode::Integer(self.integer_scale.max(1) as u32),
+        }
+    }
+
+    fn buffer_geometry(&self, width: u32, height: u32) -> (u32, u32, ScaleMode) {
+        let mode = self.scale_mode();
+        match mode {
+            ScaleMode::Fractional(scale_120) => (
+                scale_dimension(width, scale_120),
+                scale_dimension(height, scale_120),
+                mode,
+            ),
+            ScaleMode::Integer(scale) => (width * scale, height * scale, mode),
+        }
+    }
+
+    fn scale_factor(&self) -> f64 {
+        match self.scale_mode() {
+            ScaleMode::Fractional(scale_120) => scale_120 as f64 / 120.0,
+            ScaleMode::Integer(scale) => scale as f64,
+        }
+    }
 }
 
 struct Overlay {
@@ -451,31 +573,16 @@ struct Overlay {
     fractional_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     viewporter: Option<wp_viewporter::WpViewporter>,
 
-    output_name: String,
-    target_output: Option<wl_output::WlOutput>,
-    output_integer_scale: i32,
-    output_logical_size: Option<(u32, u32)>,
+    surfaces: Vec<OutputSurface>,
+    layout: Layout,
+    state: LaserState,
+    nav_keys: NavKeys,
 
-    layer: Option<LayerSurface>,
-    fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
-    viewport: Option<wp_viewport::WpViewport>,
-    pool: Option<SlotPool>,
-    /// The single `wl_shm` buffer, reused for every frame.  Reusing one slot
-    /// keeps memory bounded; a redraw is deferred until the compositor sends
-    /// `wl_buffer.release` for the previous commit.
-    buffer: Option<Buffer>,
+    /// Virtual keyboard used for `previous`/`next`.  `None` means navigation
+    /// is unavailable; `input_error` explains why without stopping the laser.
+    input: Option<Input>,
+    input_error: Option<String>,
 
-    size: Option<(u32, u32)>,
-    buffer_size: Option<(u32, u32)>,
-    fractional_scale_120: Option<u32>,
-    needs_redraw: bool,
-
-    pos: Option<(i32, i32)>,
-    center_mode: bool,
-    visible: bool,
-    radius: i32,
-
-    configured: bool,
     exit: bool,
     fatal: Option<String>,
 }
@@ -484,7 +591,37 @@ fn run_overlay(options: Options) -> Result<()> {
     let socket_path = control_socket_path()?;
     let listener = bind_control_socket(&socket_path)?;
     let (request_tx, request_rx) = channel::<ControlRequest>();
+    let net_tx = request_tx.clone();
     let control_server = ControlServer::start(socket_path, listener, request_tx)?;
+
+    // The WebSocket server (Phase 5) is a second adapter over the very same
+    // channel: both transports feed ControlRequest values to the event loop
+    // and differ only in wire format and authentication.  A bind failure
+    // degrades to socket-only operation instead of killing the laser, the
+    // same philosophy as the virtual-keyboard fallback.
+    let _net_server = match options.ws_port {
+        Some(port) => match crate::net::NetServer::start(port, net_tx) {
+            Ok(server) => {
+                eprintln!(
+                    "hypresent: websocket server on ws://0.0.0.0:{port} (pairing token required)"
+                );
+                Some(server)
+            }
+            Err(e) => {
+                eprintln!("hypresent: websocket server unavailable: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    // Keyboard input gets its own Wayland connection: if the compositor
+    // rejects the virtual keyboard, the laser overlay still works and the
+    // navigation commands report the exact limitation.
+    let (input, input_error) = match Input::connect() {
+        Ok(input) => (Some(input), None),
+        Err(e) => (None, Some(e)),
+    };
 
     let conn =
         Connection::connect_to_env().map_err(|e| Error::Wayland(format!("connect_to_env: {e}")))?;
@@ -507,6 +644,15 @@ fn run_overlay(options: Options) -> Result<()> {
         globals.bind(&qh, 1..=1, ()).ok();
     let viewporter: Option<wp_viewporter::WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
 
+    let mut state = LaserState {
+        appearance: options.appearance,
+        ..LaserState::default()
+    };
+    if let (Some(x), Some(y)) = (options.x, options.y) {
+        state.pos = Some((x, y));
+        state.center_mode = false;
+    }
+
     let mut app = Overlay {
         conn: conn.clone(),
         registry_state,
@@ -516,39 +662,34 @@ fn run_overlay(options: Options) -> Result<()> {
         shm,
         fractional_manager,
         viewporter,
-        output_name: options.output.clone(),
-        target_output: None,
-        output_integer_scale: 1,
-        output_logical_size: None,
-        layer: None,
-        fractional: None,
-        viewport: None,
-        pool: None,
-        buffer: None,
-        size: None,
-        buffer_size: None,
-        fractional_scale_120: None,
-        needs_redraw: false,
-        pos: options.x.zip(options.y),
-        center_mode: options.x.is_none(),
-        visible: true,
-        radius: options.radius,
-        configured: false,
+        surfaces: Vec::new(),
+        layout: Layout::default(),
+        state,
+        nav_keys: options.nav_keys,
+        input,
+        input_error,
         exit: false,
         fatal: None,
     };
 
     // First roundtrip populates wl_output / xdg-output information so the
-    // requested output can be selected by its compositor name.
+    // outputs can be enumerated and matched against the Hyprland layout.
     event_queue
         .roundtrip(&mut app)
         .map_err(|e| Error::Wayland(format!("initial output roundtrip: {e}")))?;
-    app.select_output(&options.output)?;
-    app.create_surface(&qh)?;
+    app.layout = app.build_layout(options.output.as_deref())?;
+    if app.state.center_mode {
+        if !app.layout.outputs.is_empty() {
+            app.state.pos = Some(app.layout.center());
+        }
+    } else if let Some((x, y)) = app.state.pos {
+        app.state.pos = Some(app.layout.clamp(x, y));
+    }
+    app.create_surfaces(&qh, options.output.as_deref())?;
 
-    // Initial commit (no buffer) asks layer-shell for a configure.  A second
-    // roundtrip lets the configure handler allocate and attach the first
-    // buffer before entering the long-running event loop.
+    // Initial commits (no buffer) ask layer-shell for configures.  A second
+    // roundtrip lets the configure handlers allocate and attach the first
+    // buffers before entering the long-running event loop.
     event_queue
         .roundtrip(&mut app)
         .map_err(|e| Error::Wayland(format!("initial configure roundtrip: {e}")))?;
@@ -576,13 +717,17 @@ fn run_overlay(options: Options) -> Result<()> {
             .dispatch(None, &mut app)
             .map_err(|e| Error::Overlay(format!("event loop error: {e}")))?;
         // Commands only record state; draw once per batch so a burst of
-        // moves cannot allocate a buffer per message.  A draw that finds the
-        // previous buffer still in use leaves the flag set and is retried
-        // after the next dispatch (which delivers `wl_buffer.release`).
-        if app.needs_redraw && !app.exit && app.fatal.is_none() {
-            app.needs_redraw = false;
-            if let Err(e) = app.draw() {
-                app.fatal = Some(e.to_string());
+        // moves cannot allocate a buffer per message.  Each surface draws
+        // independently; a surface whose previous buffer is still in use
+        // keeps its flag set and retries after the next dispatch (which
+        // delivers `wl_buffer.release`).
+        for idx in 0..app.surfaces.len() {
+            if app.surfaces[idx].needs_redraw && !app.exit && app.fatal.is_none() {
+                app.surfaces[idx].needs_redraw = false;
+                if let Err(e) = app.draw_surface(idx) {
+                    app.fatal = Some(e.to_string());
+                    break;
+                }
             }
         }
     }
@@ -595,7 +740,16 @@ fn run_overlay(options: Options) -> Result<()> {
 }
 
 impl Overlay {
-    fn select_output(&mut self, requested: &str) -> Result<()> {
+    /// Build the global layout from Hyprland IPC (`j/monitors`), matched
+    /// to the compositor's `wl_output`s by name.  Outputs the IPC does not
+    /// know fall back to the xdg-output logical position/size; outputs with
+    /// neither are laid out only after their first configure (see the
+    /// configure handler).
+    fn build_layout(&mut self, only: Option<&str>) -> Result<Layout> {
+        let monitors = hyprland::monitors().unwrap_or_default();
+        let focused = monitors.iter().find(|m| m.focused).map(|m| m.name.clone());
+
+        let mut rects = Vec::new();
         let mut available = Vec::new();
         for output in self.output_state.outputs() {
             let Some(info) = self.output_state.info(&output) else {
@@ -606,110 +760,184 @@ impl Overlay {
                 .clone()
                 .or_else(|| info.description.clone())
                 .unwrap_or_else(|| format!("<id {}>", info.id));
-            available.push(label.clone());
-            if info.name.as_deref() == Some(requested) {
-                self.target_output = Some(output);
-                self.output_name = requested.to_string();
-                self.output_integer_scale = info.scale_factor.max(1);
-                self.output_logical_size = info
-                    .logical_size
-                    .and_then(|(w, h)| (w > 0 && h > 0).then_some((w as u32, h as u32)));
-                return Ok(());
+            available.push(label);
+            let Some(name) = info.name.clone() else {
+                continue;
+            };
+            if let Some(only) = only {
+                if name != only {
+                    continue;
+                }
+            }
+            let rect = if let Some(monitor) = monitors.iter().find(|m| m.name == name) {
+                let (w, h) = monitor.logical_size();
+                OutputRect {
+                    name: name.clone(),
+                    x: monitor.x,
+                    y: monitor.y,
+                    width: w,
+                    height: h,
+                }
+            } else if let (Some((x, y)), Some((w, h))) = (info.logical_position, info.logical_size)
+            {
+                if w <= 0 || h <= 0 {
+                    continue;
+                }
+                OutputRect {
+                    name: name.clone(),
+                    x,
+                    y,
+                    width: w as u32,
+                    height: h as u32,
+                }
+            } else {
+                continue;
+            };
+            rects.push(rect);
+        }
+
+        if let Some(only) = only {
+            if rects.is_empty() {
+                return Err(Error::Overlay(format!(
+                    "output `{only}` not found (available: {})",
+                    if available.is_empty() {
+                        "none reported".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                )));
             }
         }
-        Err(Error::Overlay(format!(
-            "output `{requested}` not found (available: {})",
-            if available.is_empty() {
-                "none reported".to_string()
-            } else {
-                available.join(", ")
-            }
-        )))
+        let focused = focused.filter(|name| rects.iter().any(|r| &r.name == name));
+        Ok(Layout::new(rects, focused))
     }
 
-    fn create_surface(&mut self, qh: &QueueHandle<Self>) -> Result<()> {
-        let output = self
-            .target_output
-            .clone()
-            .ok_or_else(|| Error::Overlay("no target output selected".into()))?;
-        let surface = self.compositor.create_surface(qh);
-        let layer = self.layer_shell.create_layer_surface(
-            qh,
-            surface,
-            Layer::Overlay,
-            Some("hyprpresenter-laser"),
-            Some(&output),
-        );
+    fn create_surfaces(&mut self, qh: &QueueHandle<Self>, only: Option<&str>) -> Result<()> {
+        let mut created = 0usize;
+        for output in self.output_state.outputs() {
+            let Some(info) = self.output_state.info(&output) else {
+                continue;
+            };
+            let Some(name) = info.name.clone() else {
+                continue;
+            };
+            if let Some(only) = only {
+                if name != only {
+                    continue;
+                }
+            }
+            // With an --output filter the layout was already checked and
+            // errors out for unknown names; without one, every named output
+            // gets a surface.
+            let surface = self.compositor.create_surface(qh);
+            let layer = self.layer_shell.create_layer_surface(
+                qh,
+                surface,
+                Layer::Overlay,
+                Some("hyprpresenter-laser"),
+                Some(&output),
+            );
 
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        // With opposite edges anchored, a zero size means "full output"; the
-        // actual logical size arrives in the configure event.
-        layer.set_size(0, 0);
-        // -1 makes the layer ignore other surfaces' exclusive zones (e.g. a
-        // 36px top bar) and extend to the output edges.  The surface is
-        // transparent, so it does not visually cover the panel; it just
-        // allows the dot to reach every pixel of the monitor.
-        layer.set_exclusive_zone(-1);
-        layer.set_margin(0, 0, 0, 0);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+            // With opposite edges anchored, a zero size means "full output";
+            // the actual logical size arrives in the configure event.
+            layer.set_size(0, 0);
+            // -1 makes the layer ignore other surfaces' exclusive zones (e.g.
+            // a 36px top bar) and extend to the output edges.  The surface is
+            // transparent, so it does not visually cover the panel; it just
+            // allows the dot to reach every pixel of the monitor.
+            layer.set_exclusive_zone(-1);
+            layer.set_margin(0, 0, 0, 0);
+            layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
-        // Explicitly empty input region: no pointer events are delivered to
-        // this surface, so clicks go to whatever is underneath it.
-        let region = Region::new(&self.compositor)
-            .map_err(|e| Error::Wayland(format!("failed to create empty input region: {e}")))?;
-        layer.set_input_region(Some(region.wl_region()));
-        drop(region);
+            // Explicitly empty input region: no pointer events are delivered
+            // to this surface, so clicks go to whatever is underneath it.
+            let region = Region::new(&self.compositor)
+                .map_err(|e| Error::Wayland(format!("failed to create empty input region: {e}")))?;
+            layer.set_input_region(Some(region.wl_region()));
+            drop(region);
 
-        if let Some(manager) = &self.fractional_manager {
-            self.fractional = Some(manager.get_fractional_scale(layer.wl_surface(), qh, ()));
+            let fractional = self
+                .fractional_manager
+                .as_ref()
+                .map(|manager| manager.get_fractional_scale(layer.wl_surface(), qh, ()));
+            let viewport = self
+                .viewporter
+                .as_ref()
+                .map(|viewporter| viewporter.get_viewport(layer.wl_surface(), qh, ()));
+
+            layer.commit();
+            self.surfaces.push(OutputSurface {
+                output,
+                name,
+                layer,
+                fractional,
+                viewport,
+                pool: None,
+                buffer: None,
+                size: None,
+                buffer_size: None,
+                fractional_scale_120: None,
+                integer_scale: info.scale_factor.max(1),
+                configured: false,
+                needs_redraw: false,
+            });
+            created += 1;
         }
-        if let Some(viewporter) = &self.viewporter {
-            self.viewport = Some(viewporter.get_viewport(layer.wl_surface(), qh, ()));
-        }
-
-        layer.commit();
         self.conn
             .flush()
-            .map_err(|e| Error::Wayland(format!("flush initial surface commit: {e}")))?;
-        self.layer = Some(layer);
+            .map_err(|e| Error::Wayland(format!("flush initial surface commits: {e}")))?;
+        if created == 0 {
+            return Err(Error::Overlay(
+                "no outputs available for the overlay".into(),
+            ));
+        }
         Ok(())
     }
 
-    fn scale_mode(&self) -> ScaleMode {
-        match (self.fractional_scale_120, self.viewport.as_ref()) {
-            (Some(scale_120), Some(_)) if scale_120 > 0 => ScaleMode::Fractional(scale_120),
-            _ => ScaleMode::Integer(self.output_integer_scale.max(1) as u32),
-        }
+    /// The layout rect a surface draws against.  Falls back to a
+    /// surface-local rect at the origin when the layout does not know the
+    /// output (the configure handler adds such outputs when they report a
+    /// size, so this is only a transient state).
+    fn surface_rect(&self, surface: &OutputSurface) -> OutputRect {
+        self.layout
+            .outputs
+            .iter()
+            .find(|r| r.name == surface.name)
+            .cloned()
+            .unwrap_or(OutputRect {
+                name: surface.name.clone(),
+                x: 0,
+                y: 0,
+                width: surface.size.map(|(w, _)| w).unwrap_or(0),
+                height: surface.size.map(|(_, h)| h).unwrap_or(0),
+            })
     }
 
-    fn buffer_geometry(&self, width: u32, height: u32) -> (u32, u32, ScaleMode) {
-        let mode = self.scale_mode();
-        match mode {
-            ScaleMode::Fractional(scale_120) => (
-                scale_dimension(width, scale_120),
-                scale_dimension(height, scale_120),
-                mode,
-            ),
-            ScaleMode::Integer(scale) => (width * scale, height * scale, mode),
-        }
-    }
+    fn draw_surface(&mut self, idx: usize) -> Result<()> {
+        // Compute everything that depends on shared state first, so the
+        // mutable borrow of the surface below stays conflict-free.
+        let rect = self.surface_rect(&self.surfaces[idx]);
+        let dot_local = if self.state.visible {
+            self.state.pos.and_then(|(gx, gy)| rect.to_local(gx, gy))
+        } else {
+            None
+        };
+        let appearance = self.state.appearance;
 
-    fn draw(&mut self) -> Result<()> {
-        if !self.configured {
+        let surface = &mut self.surfaces[idx];
+        if !surface.configured {
             return Ok(());
         }
-        let layer = match self.layer.as_ref() {
-            Some(layer) => layer,
+        let (width, height) = match surface.size {
+            Some(size) => size,
             None => return Ok(()),
         };
-        let (width, height) = self
-            .size
-            .ok_or_else(|| Error::Overlay("surface has no configured size".into()))?;
         if width == 0 || height == 0 {
             return Ok(());
         }
 
-        let (buffer_width, buffer_height, mode) = self.buffer_geometry(width, height);
+        let (buffer_width, buffer_height, mode) = surface.buffer_geometry(width, height);
         let stride = (buffer_width as i32)
             .checked_mul(4)
             .ok_or_else(|| Error::Overlay("buffer stride overflow".into()))?;
@@ -717,19 +945,19 @@ impl Overlay {
             .checked_mul(buffer_height as usize)
             .ok_or_else(|| Error::Overlay("buffer size overflow".into()))?;
 
-        if self.pool.is_none() {
-            self.pool = Some(
+        if surface.pool.is_none() {
+            surface.pool = Some(
                 SlotPool::new(len, &self.shm)
                     .map_err(|e| Error::Overlay(format!("failed to create shm pool: {e}")))?,
             );
         }
 
-        if self.buffer.is_none() || self.buffer_size != Some((buffer_width, buffer_height)) {
-            // Drop a stale buffer first so its slot returns to the pool before
-            // the new allocation (if the compositor already released it).
-            self.buffer = None;
-            self.buffer_size = None;
-            let (buffer, _) = self
+        if surface.buffer.is_none() || surface.buffer_size != Some((buffer_width, buffer_height)) {
+            // Drop a stale buffer first so its slot returns to the pool
+            // before the new allocation (if the compositor released it).
+            surface.buffer = None;
+            surface.buffer_size = None;
+            let (buffer, _) = surface
                 .pool
                 .as_mut()
                 .expect("pool was just created")
@@ -740,20 +968,21 @@ impl Overlay {
                     wl_shm::Format::Argb8888,
                 )
                 .map_err(|e| Error::Overlay(format!("failed to allocate shm buffer: {e}")))?;
-            self.buffer = Some(buffer);
+            surface.buffer = Some(buffer);
         }
 
-        let buffer = self.buffer.take().expect("buffer was just created");
+        let buffer = surface.buffer.take().expect("buffer was just created");
         if buffer.slot().has_active_buffers() {
             // The compositor has not released the previous commit yet.  Keep
-            // the buffer and retry after `wl_buffer.release`; allocating a new
-            // slot here is what made rapid moves grow the pool without bound.
-            self.buffer = Some(buffer);
-            self.needs_redraw = true;
+            // the buffer and retry after `wl_buffer.release`; allocating a
+            // new slot here is what made rapid moves grow the pool without
+            // bound in the single-surface version.
+            surface.buffer = Some(buffer);
+            surface.needs_redraw = true;
             return Ok(());
         }
 
-        let canvas = self
+        let canvas = surface
             .pool
             .as_mut()
             .expect("pool was just created")
@@ -761,130 +990,148 @@ impl Overlay {
             .ok_or_else(|| Error::Overlay("shm buffer is unexpectedly busy".into()))?;
 
         canvas.fill(0);
-        if self.visible {
-            if let Some((x, y)) = self.pos {
-                let scale_x = buffer_width as f64 / width as f64;
-                let scale_y = buffer_height as f64 / height as f64;
-                // Pixel centres: logical pixel (x, y) covers [x,x+1)x[y,y+1).
-                let center_x = (x as f64 + 0.5) * scale_x;
-                let center_y = (y as f64 + 0.5) * scale_y;
-                let radius = self.radius as f64 * (scale_x + scale_y) / 2.0;
-                paint_dot(
-                    canvas,
-                    buffer_width,
-                    buffer_height,
-                    center_x,
-                    center_y,
-                    radius,
-                );
-            }
+        if let Some((x, y)) = dot_local {
+            let scale_x = buffer_width as f64 / width as f64;
+            let scale_y = buffer_height as f64 / height as f64;
+            // Pixel centres: logical pixel (x, y) covers [x,x+1)x[y,y+1).
+            let center_x = (x as f64 + 0.5) * scale_x;
+            let center_y = (y as f64 + 0.5) * scale_y;
+            let radius = appearance.radius as f64 * (scale_x + scale_y) / 2.0;
+            paint_dot(
+                canvas,
+                buffer_width,
+                buffer_height,
+                center_x,
+                center_y,
+                radius,
+                appearance.color,
+            );
         }
 
         match mode {
             ScaleMode::Fractional(_) => {
-                if let Some(viewport) = &self.viewport {
+                if let Some(viewport) = &surface.viewport {
                     viewport.set_destination(width as i32, height as i32);
                 }
-                layer
+                surface
+                    .layer
                     .set_buffer_scale(1)
                     .map_err(|_| Error::Overlay("wl_surface v3 is required".into()))?;
             }
             ScaleMode::Integer(scale) => {
-                if let Some(viewport) = &self.viewport {
+                if let Some(viewport) = &surface.viewport {
                     viewport.set_destination(-1, -1);
                 }
-                layer
+                surface
+                    .layer
                     .set_buffer_scale(scale)
                     .map_err(|_| Error::Overlay("wl_surface v3 is required".into()))?;
             }
         }
 
         buffer
-            .attach_to(layer.wl_surface())
+            .attach_to(surface.layer.wl_surface())
             .map_err(|e| Error::Overlay(format!("failed to attach shm buffer: {e}")))?;
-        layer.wl_surface().damage(0, 0, width as i32, height as i32);
-        layer.commit();
+        surface
+            .layer
+            .wl_surface()
+            .damage(0, 0, width as i32, height as i32);
+        surface.layer.commit();
         self.conn
             .flush()
             .map_err(|e| Error::Wayland(format!("flush surface commit: {e}")))?;
 
-        self.buffer = Some(buffer);
-        self.buffer_size = Some((buffer_width, buffer_height));
+        surface.buffer = Some(buffer);
+        surface.buffer_size = Some((buffer_width, buffer_height));
         Ok(())
     }
 
+    /// Adapter between the transport and the command core: state-changing
+    /// commands go to the core; this layer only executes the side effects
+    /// (navigation keys, shutdown) and composes the session-rich `status`
+    /// reply around the core's state line.
     fn apply_command(&mut self, command: Command) -> String {
-        match command {
-            Command::Move(x, y) => {
-                let (x, y) = self.clamp_position(x, y);
-                self.pos = Some((x, y));
-                self.center_mode = false;
-                self.needs_redraw = true;
-                format!("ok dot={x},{y}")
+        if matches!(command, Command::Status) {
+            return self.status_line();
+        }
+        let outcome = self.state.apply(command, &self.layout);
+        if outcome.redraw {
+            for surface in &mut self.surfaces {
+                surface.needs_redraw = true;
             }
-            Command::Center => {
-                let Some((width, height)) = self.size else {
-                    return "error: surface is not configured yet".to_string();
-                };
-                self.center_mode = true;
-                self.pos = Some((width as i32 / 2, height as i32 / 2));
-                self.needs_redraw = true;
-                format!("ok dot={},{}", width / 2, height / 2)
-            }
-            Command::Show => {
-                self.visible = true;
-                self.needs_redraw = true;
-                "ok visible=1".to_string()
-            }
-            Command::Hide => {
-                self.visible = false;
-                self.needs_redraw = true;
-                "ok visible=0".to_string()
-            }
-            Command::Status => self.status_line(),
-            Command::Quit => {
+        }
+        match outcome.action {
+            None => outcome.reply,
+            Some(Action::Quit) => {
                 self.exit = true;
-                "ok shutting down".to_string()
+                outcome.reply
+            }
+            Some(Action::Navigate(key)) => self.navigate(key),
+        }
+    }
+
+    fn navigate(&mut self, key: PresentationKey) -> String {
+        let result = match self.input.as_mut() {
+            Some(input) => input.tap(key, self.nav_keys),
+            None => {
+                let reason = self.input_error.as_deref().unwrap_or("not initialised");
+                return format!("error: virtual keyboard unavailable: {reason}");
+            }
+        };
+        match result {
+            Ok(()) => {
+                if self.nav_keys == NavKeys::default() {
+                    format!("ok {} key={}", key.command_name(), key.key_name())
+                } else {
+                    // With a custom mapping the PageUp/PageDown names would
+                    // be wrong; report the evdev code that was injected.
+                    format!(
+                        "ok {} keycode={}",
+                        key.command_name(),
+                        key.evdev_code(self.nav_keys)
+                    )
+                }
+            }
+            Err(e) => {
+                // A protocol error poisons the connection; keep the laser
+                // running and report the failure on subsequent attempts.
+                self.input = None;
+                self.input_error = Some(e.clone());
+                format!("error: {e}")
             }
         }
     }
 
-    fn clamp_position(&self, x: i32, y: i32) -> (i32, i32) {
-        clamp_position(self.size, x, y)
-    }
-
     fn status_line(&self) -> String {
-        let (logical_w, logical_h) = self.size.unwrap_or((0, 0));
-        let (buffer_w, buffer_h) = self.buffer_size.unwrap_or((0, 0));
-        let (x, y) = self.pos.unwrap_or((0, 0));
-        let scale = match self.scale_mode() {
-            ScaleMode::Fractional(scale_120) => scale_120 as f64 / 120.0,
-            ScaleMode::Integer(scale) => scale as f64,
-        };
+        let names = self
+            .surfaces
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let buffers = self
+            .surfaces
+            .iter()
+            .map(|s| {
+                let (bw, bh) = s.buffer_size.unwrap_or((0, 0));
+                format!("{}:{}x{}@{:.3}", s.name, bw, bh, s.scale_factor())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let configured = self.surfaces.iter().filter(|s| s.configured).count();
         format!(
-            "output={} visible={} logical={}x{} buffer={}x{} dot={},{} radius={} scale={:.3} configured={}",
-            self.output_name,
-            u8::from(self.visible),
-            logical_w,
-            logical_h,
-            buffer_w,
-            buffer_h,
-            x,
-            y,
-            self.radius,
-            scale,
-            u8::from(self.configured),
+            "outputs={} {} keyboard={} buffers={} configured={}/{}",
+            names,
+            self.state.state_line(&self.layout),
+            if self.input.is_some() {
+                "ready"
+            } else {
+                "unavailable"
+            },
+            buffers,
+            configured,
+            self.surfaces.len(),
         )
-    }
-}
-
-fn clamp_position(size: Option<(u32, u32)>, x: i32, y: i32) -> (i32, i32) {
-    match size {
-        Some((width, height)) => (
-            x.clamp(0, width.saturating_sub(1) as i32),
-            y.clamp(0, height.saturating_sub(1) as i32),
-        ),
-        None => (x.max(0), y.max(0)),
     }
 }
 
@@ -894,7 +1141,7 @@ fn scale_dimension(logical: u32, scale_120: u32) -> u32 {
     ((logical as u64 * scale_120 as u64 + 60) / 120).max(1) as u32
 }
 
-/// Paint an anti-aliased red dot into a premultiplied ARGB8888 buffer.
+/// Paint an anti-aliased dot into a premultiplied ARGB8888 buffer.
 fn paint_dot(
     canvas: &mut [u8],
     buffer_width: u32,
@@ -902,6 +1149,7 @@ fn paint_dot(
     center_x: f64,
     center_y: f64,
     radius: f64,
+    color: crate::command::Rgb,
 ) {
     if buffer_width == 0 || buffer_height == 0 || radius <= 0.0 {
         return;
@@ -925,8 +1173,13 @@ fn paint_dot(
                 continue;
             }
             let alpha = (coverage * 255.0).round() as u32;
-            // Premultiplied red: (A << 24) | (R << 16) with G = B = 0.
-            let pixel = (alpha << 24) | (alpha << 16);
+            // Premultiplied ARGB8888, so the transparent parts of the buffer
+            // stay genuinely transparent and the surface remains click-through.
+            let premultiply = |channel: u8| (channel as u32 * alpha + 127) / 255;
+            let pixel = (alpha << 24)
+                | (premultiply(color.r) << 16)
+                | (premultiply(color.g) << 8)
+                | premultiply(color.b);
             let offset = ((y as usize * buffer_width as usize) + x as usize) * 4;
             canvas[offset..offset + 4].copy_from_slice(&pixel.to_ne_bytes());
         }
@@ -946,14 +1199,23 @@ impl CompositorHandler for Overlay {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        self.output_integer_scale = new_factor.max(1);
-        // A fractional scale is more precise; only re-render when the integer
-        // fallback is actually in use.
-        if matches!(self.scale_mode(), ScaleMode::Integer(_)) && self.configured {
-            self.needs_redraw = true;
+        let Some(idx) = self
+            .surfaces
+            .iter()
+            .position(|s| s.layer.wl_surface().id() == surface.id())
+        else {
+            return;
+        };
+        self.surfaces[idx].integer_scale = new_factor.max(1);
+        // A fractional scale is more precise; only re-render when the
+        // integer fallback is actually in use on this surface.
+        if matches!(self.surfaces[idx].scale_mode(), ScaleMode::Integer(_))
+            && self.surfaces[idx].configured
+        {
+            self.surfaces[idx].needs_redraw = true;
         }
     }
 
@@ -964,8 +1226,9 @@ impl CompositorHandler for Overlay {
         _surface: &wl_surface::WlSurface,
         _new_transform: wl_output::Transform,
     ) {
-        // The proof-of-concept target output is unrotated.  Rotated outputs
-        // would need the buffer transform applied while drawing.
+        // Rotated outputs are not specially handled: the buffer is drawn in
+        // the surface's logical orientation, as in the single-output proof
+        // of concept.
     }
 
     fn frame(
@@ -1007,6 +1270,8 @@ impl OutputHandler for Overlay {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
+        // Surfaces are created once at startup from the enumerated outputs;
+        // hot-plug after startup is not handled in this phase.
     }
 
     fn update_output(
@@ -1015,17 +1280,16 @@ impl OutputHandler for Overlay {
         _qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        if self.target_output.as_ref() != Some(&output) {
+        let Some(idx) = self.surfaces.iter().position(|s| s.output == output) else {
             return;
-        }
+        };
         if let Some(info) = self.output_state.info(&output) {
-            self.output_integer_scale = info.scale_factor.max(1);
-            self.output_logical_size = info
-                .logical_size
-                .and_then(|(w, h)| (w > 0 && h > 0).then_some((w as u32, h as u32)));
+            self.surfaces[idx].integer_scale = info.scale_factor.max(1);
         }
-        if matches!(self.scale_mode(), ScaleMode::Integer(_)) && self.configured {
-            self.needs_redraw = true;
+        if matches!(self.surfaces[idx].scale_mode(), ScaleMode::Integer(_))
+            && self.surfaces[idx].configured
+        {
+            self.surfaces[idx].needs_redraw = true;
         }
     }
 
@@ -1035,15 +1299,27 @@ impl OutputHandler for Overlay {
         _qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        if self.target_output.as_ref() == Some(&output) {
-            self.fatal = Some("target output was removed".to_string());
+        if let Some(idx) = self.surfaces.iter().position(|s| s.output == output) {
+            let removed = self.surfaces.remove(idx);
+            self.layout.outputs.retain(|r| r.name != removed.name);
+            if self.layout.focused.as_deref() == Some(removed.name.as_str()) {
+                self.layout.focused = None;
+            }
+            if self.surfaces.is_empty() {
+                self.exit = true;
+            }
         }
     }
 }
 
 impl LayerShellHandler for Overlay {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        if let Some(idx) = self.surfaces.iter().position(|s| &s.layer == layer) {
+            self.surfaces.remove(idx);
+        }
+        if self.surfaces.is_empty() {
+            self.exit = true;
+        }
     }
 
     fn configure(
@@ -1054,36 +1330,53 @@ impl LayerShellHandler for Overlay {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if self.layer.as_ref() != Some(layer) {
+        let Some(idx) = self.surfaces.iter().position(|s| &s.layer == layer) else {
             return;
-        }
+        };
         let (mut width, mut height) = configure.new_size;
         if width == 0 || height == 0 {
-            if let Some((fallback_w, fallback_h)) = self.output_logical_size {
-                if width == 0 {
-                    width = fallback_w;
-                }
-                if height == 0 {
-                    height = fallback_h;
-                }
+            // Fall back to the layout size for this output (its logical
+            // size from Hyprland IPC / xdg-output).
+            let rect = self.surface_rect(&self.surfaces[idx]);
+            if width == 0 {
+                width = rect.width;
+            }
+            if height == 0 {
+                height = rect.height;
             }
         }
         if width == 0 || height == 0 {
             self.fatal = Some(format!(
-                "compositor sent an unusable layer-shell size {width}x{height}"
+                "compositor sent an unusable layer-shell size {width}x{height} for output {}",
+                self.surfaces[idx].name
             ));
             return;
         }
 
-        self.size = Some((width, height));
-        self.configured = true;
-        if self.center_mode || self.pos.is_none() {
-            self.pos = Some((width as i32 / 2, height as i32 / 2));
-        } else if let Some((x, y)) = self.pos {
-            self.pos = Some(self.clamp_position(x, y));
+        // An output the layout did not know (no IPC entry, no xdg-output
+        // geometry) joins the layout at the origin with its configured
+        // size, so single-output fallback behaviour is preserved.
+        if !self
+            .layout
+            .outputs
+            .iter()
+            .any(|r| r.name == self.surfaces[idx].name)
+        {
+            self.layout.outputs.push(OutputRect {
+                name: self.surfaces[idx].name.clone(),
+                x: 0,
+                y: 0,
+                width,
+                height,
+            });
+            if self.state.pos.is_none() {
+                self.state.pos = Some(self.layout.center());
+            }
         }
 
-        if let Err(e) = self.draw() {
+        self.surfaces[idx].size = Some((width, height));
+        self.surfaces[idx].configured = true;
+        if let Err(e) = self.draw_surface(idx) {
             self.fatal = Some(e.to_string());
         }
     }
@@ -1110,16 +1403,22 @@ impl Dispatch<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()> fo
 impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for Overlay {
     fn event(
         state: &mut Self,
-        _proxy: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        proxy: &wp_fractional_scale_v1::WpFractionalScaleV1,
         event: wp_fractional_scale_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-            state.fractional_scale_120 = Some(scale);
-            if state.configured {
-                state.needs_redraw = true;
+            if let Some(idx) = state
+                .surfaces
+                .iter()
+                .position(|s| s.fractional.as_ref().map(|f| f.id()) == Some(proxy.id()))
+            {
+                state.surfaces[idx].fractional_scale_120 = Some(scale);
+                if state.surfaces[idx].configured {
+                    state.surfaces[idx].needs_redraw = true;
+                }
             }
         }
     }
@@ -1158,24 +1457,7 @@ delegate_registry!(Overlay);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_test_commands() {
-        assert_eq!(parse_command("move 12 34"), Ok(Command::Move(12, 34)));
-        assert_eq!(parse_command("move -5 0"), Ok(Command::Move(-5, 0)));
-        assert_eq!(parse_command("center"), Ok(Command::Center));
-        assert_eq!(parse_command("show"), Ok(Command::Show));
-        assert_eq!(parse_command("hide"), Ok(Command::Hide));
-        assert_eq!(parse_command("status"), Ok(Command::Status));
-        assert_eq!(parse_command("quit"), Ok(Command::Quit));
-        assert_eq!(parse_command("exit"), Ok(Command::Quit));
-
-        assert!(parse_command("").is_err());
-        assert!(parse_command("move 1").is_err());
-        assert!(parse_command("move 1 2 3").is_err());
-        assert!(parse_command("move a b").is_err());
-        assert!(parse_command("nope").is_err());
-    }
+    use crate::command::Rgb;
 
     #[test]
     fn fractional_buffer_size_rounds_to_physical_pixels() {
@@ -1191,7 +1473,7 @@ mod tests {
         let width = 32u32;
         let height = 32u32;
         let mut canvas = vec![0u8; (width * height * 4) as usize];
-        paint_dot(&mut canvas, width, height, 16.0, 16.0, 8.0);
+        paint_dot(&mut canvas, width, height, 16.0, 16.0, 8.0, Rgb::RED);
 
         let center = ((16 * width + 16) * 4) as usize;
         let pixel = u32::from_ne_bytes(canvas[center..center + 4].try_into().unwrap());
@@ -1208,11 +1490,22 @@ mod tests {
     }
 
     #[test]
-    fn clamps_positions_to_surface() {
-        let size = Some((1536, 960));
-        assert_eq!(clamp_position(size, -10, 2000), (0, 959));
-        assert_eq!(clamp_position(size, 100, 200), (100, 200));
-        assert_eq!(clamp_position(size, 1535, 959), (1535, 959));
-        assert_eq!(clamp_position(None, -10, -20), (0, 0));
+    fn paints_requested_color_premultiplied() {
+        let width = 16u32;
+        let height = 16u32;
+        let mut canvas = vec![0u8; (width * height * 4) as usize];
+        let blue = Rgb {
+            r: 0x10,
+            g: 0x20,
+            b: 0xff,
+        };
+        paint_dot(&mut canvas, width, height, 8.0, 8.0, 5.0, blue);
+
+        let center = ((8 * width + 8) * 4) as usize;
+        let pixel = u32::from_ne_bytes(canvas[center..center + 4].try_into().unwrap());
+        assert_eq!(pixel >> 24, 0xff, "centre alpha should be opaque");
+        assert_eq!((pixel >> 16) & 0xff, 0x10);
+        assert_eq!((pixel >> 8) & 0xff, 0x20);
+        assert_eq!(pixel & 0xff, 0xff);
     }
 }

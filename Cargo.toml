@@ -10,6 +10,12 @@ readme = "README.md"
 keywords = ["hyprland", "wayland", "presentation", "laser-pointer", "overlay"]
 categories = ["command-line-utilities", "gui"]
 
+# The command is `hypresent` (short on purpose — it is typed constantly
+# during presentations); the package and repository keep the full name.
+[[bin]]
+name = "hypresent"
+path = "src/main.rs"
+
 [dependencies]
 # Hyprland's IPC socket replies are JSON; serde is the standard, zero-cost
 # way to deserialize them into typed structs.
@@ -21,6 +27,16 @@ serde_json = "1"
 smithay-client-toolkit = "0.19"
 # Small, zero-runtime derive macro for the project's single error type.
 thiserror = "2"
+# Synchronous WebSocket implementation for the Phase 5 LAN server.  It fits
+# the project's thread + channel shape, so no async runtime is pulled in.
+# TLS features stay off: the trust model is pairing token + local network.
+tungstenite = "0.28"
+# SHA-256 for the pairing token: only the hash of the token is stored.
+sha2 = "0.10"
+# QR code generation for `pair`: renders the pairing URI (host+port+token)
+# as a terminal QR the phone app scans, so the token never has to be typed.
+# Only the pure core is used (no image/svg renderers).
+qrcode = { version = "0.14", default-features = false }
 # Use the system libwayland client backend rather than the pure-Rust fallback.
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 # Wayland client bindings. The probe enumerates compositor globals; the overlay
@@ -29,6 +45,10 @@ wayland-client = "0.31"
 # Stable/staging protocol bindings used by the probe and the overlay's
 # fractional-scale (wp_fractional_scale_v1) + viewporter path.
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# Unstable virtual-keyboard protocol used for previous/next presentation
+# navigation. The compositor's own keymap is forwarded, so no layout is
+# hardcoded or generated here.
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 [profile.release]
 lto = "thin"

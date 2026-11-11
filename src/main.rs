@@ -6,13 +6,16 @@
 //! - an empty input region (pointer passthrough)
 //! - `wl_shm` for software rendering (no GPU dependency)
 //!
-//! Test control is via a small local UNIX socket so no networking is needed in
-//! this phase.  The socket handler feeds the same command values the future
-//! WebSocket command handler will use, so it can be replaced without touching
-//! the rendering code.
+//! Control arrives over a small local UNIX socket and, since Phase 5, a
+//! LAN WebSocket server for paired phones.  Both handlers feed the same
+//! command values into the command core, so transports can change without
+//! touching the rendering code.
 
+mod command;
 mod error;
 mod hyprland;
+mod input;
+mod net;
 mod overlay;
 mod wayland_probe;
 
@@ -25,7 +28,7 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("hyprpresenter: error: {e}");
+            eprintln!("hypresent: error: {e}");
             ExitCode::from(e.exit_code() as u8)
         }
     }
@@ -35,12 +38,13 @@ fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("status") => cmd_status(),
         Some("probe") => cmd_probe(),
+        Some("pair") => net::cmd_pair(&args[1..]),
         Some("overlay") => {
             let rest = &args[1..];
             overlay::run(rest)
         }
         Some("--version") | Some("-V") => {
-            println!("hyprpresenter {}", env!("CARGO_PKG_VERSION"));
+            println!("hypresent {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some(other) => Err(Error::UnknownCommand(other.to_string())),
@@ -53,16 +57,17 @@ fn run(args: &[String]) -> Result<()> {
 
 fn print_usage() {
     println!(
-        "hyprpresenter {} — presentation remote for Hyprland
+        "hypresent {} — presentation remote for Hyprland
 
 USAGE:
-  hyprpresenter status       health check: Hyprland session, version, monitors
-  hyprpresenter probe        check which Wayland protocols the compositor offers
-  hyprpresenter overlay      run the laser overlay (`overlay --help` for controls)
-  hyprpresenter --version    print version
+  hypresent status       health check: Hyprland session, version, monitors
+  hypresent probe        check which Wayland protocols the compositor offers
+  hypresent overlay      run the laser overlay (`overlay --help` for controls)
+  hypresent pair         pair a phone (fresh QR + token; re-pairing rotates it)
+  hypresent --version    print version
 
-The phone remote, slide control, and networking are not implemented yet —\
-see README.md for the planned architecture.",
+The overlay serves paired phones over LAN WebSocket; the Android app
+lives in mobile/ in this repository — see README.md.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -71,7 +76,7 @@ fn cmd_status() -> Result<()> {
     let version = hyprland::version()?;
     let monitors = hyprland::monitors()?;
 
-    println!("hyprpresenter {} — status", env!("CARGO_PKG_VERSION"));
+    println!("hypresent {} — status", env!("CARGO_PKG_VERSION"));
     println!();
     println!(
         "  Hyprland : {} (branch {}, commit {})",
@@ -97,13 +102,10 @@ fn cmd_status() -> Result<()> {
 
 fn cmd_probe() -> Result<()> {
     let globals = wayland_probe::run()?;
-    println!(
-        "hyprpresenter {} — Wayland probe",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("hypresent {} — Wayland probe", env!("CARGO_PKG_VERSION"));
     println!();
     println!(
-        "  compositor advertised {} globals; HyprPresenter needs:",
+        "  compositor advertised {} globals; hypresent needs:",
         globals.len()
     );
     println!("{}", wayland_probe::report(&globals));

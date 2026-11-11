@@ -38,6 +38,27 @@ pub struct Monitor {
     pub focused: bool,
     #[serde(default)]
     pub active: bool,
+    /// Output scale factor; 1.0 when the reply does not carry one.
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+}
+
+fn default_scale() -> f32 {
+    1.0
+}
+
+impl Monitor {
+    /// Logical size of the output: Hyprland reports `width`/`height` as
+    /// physical pixels and `x`/`y` already in logical layout coordinates,
+    /// so the logical size is the physical size divided by the scale
+    /// (1920x1200 @ 1.25 -> 1536x960), rounded to the nearest pixel.
+    pub fn logical_size(&self) -> (u32, u32) {
+        let scale = if self.scale > 0.0 { self.scale } else { 1.0 } as f64;
+        (
+            (self.width as f64 / scale).round().max(1.0) as u32,
+            (self.height as f64 / scale).round().max(1.0) as u32,
+        )
+    }
 }
 
 /// Version info as reported by `hyprctl j/version`.
@@ -107,13 +128,13 @@ pub fn request(command: &str) -> Result<String> {
     Ok(reply)
 }
 
-/// `j/version` — used by `hyprpresenter status`.
+/// `j/version` — used by `hypresent status`.
 pub fn version() -> Result<Version> {
     let reply = request("j/version")?;
     serde_json::from_str(&reply).map_err(Error::InvalidJson)
 }
 
-/// `j/monitors` — used by `hyprpresenter status` and, later, overlay placement.
+/// `j/monitors` — used by `hypresent status` and, later, overlay placement.
 pub fn monitors() -> Result<Vec<Monitor>> {
     let reply = request("j/monitors")?;
     serde_json::from_str(&reply).map_err(Error::InvalidJson)
@@ -133,7 +154,7 @@ mod tests {
                 "make": "KDB", "model": "0x0702", "serial": "",
                 "width": 1920, "height": 1200,
                 "physicalWidth": 300, "physicalHeight": 190,
-                "refreshRate": 59.999, "x": -1536, "y": 120,
+                "refreshRate": 59.999, "x": -1536, "y": 120, "scale": 1.25,
                 "activeWorkspace": {"id": 1, "name": "1"},
                 "focused": true, "active": true
             },
@@ -150,6 +171,11 @@ mod tests {
         // Missing booleans default to false rather than failing.
         assert!(!monitors[1].focused);
         assert!(!monitors[1].active);
+        // Scale drives the logical size: 1920x1200 @ 1.25 -> 1536x960,
+        // and a missing scale defaults to 1.0 (logical == physical).
+        assert_eq!(monitors[0].logical_size(), (1536, 960));
+        assert_eq!(monitors[1].scale, 1.0);
+        assert_eq!(monitors[1].logical_size(), (1920, 1080));
     }
 
     /// `j/version` reply shape, including a missing optional `tag`.

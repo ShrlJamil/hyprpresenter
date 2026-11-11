@@ -1,10 +1,10 @@
 //! Read-only Wayland protocol probe: connect to the compositor, list the
-//! globals it advertises, and report which ones HyprPresenter's later phases
-//! depend on (layer-shell for the overlay, virtual-pointer for remote input,
-//! fractional-scale/viewporter for HiDPI rendering).
+//! globals it advertises, and report which ones HyprPresenter depends on
+//! (layer-shell for the overlay, virtual-keyboard for presentation
+//! navigation, fractional-scale/viewporter for HiDPI rendering).
 //!
 //! This never creates a surface or binds anything — it is a pure discovery
-//! step so `hyprpresenter probe` can answer "can the overlay work here?"
+//! step so `hypresent probe` can answer "can the overlay work here?"
 //! before Phase 4 commits to an implementation.
 
 use wayland_client::protocol::{wl_output, wl_registry};
@@ -18,7 +18,12 @@ const NEEDED: &[(&str, u32, &str)] = &[
     (
         "zwlr_virtual_pointer_manager_v1",
         1,
-        "remote prev/next + pointer injection",
+        "pointer injection (not used for laser movement)",
+    ),
+    (
+        "zwp_virtual_keyboard_manager_v1",
+        1,
+        "presentation previous/next key injection",
     ),
     (
         "wp_fractional_scale_manager_v1",

@@ -44,7 +44,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     /// Process exit code for `main`. Distinct codes make scripting
-    /// (`hyprpresenter status && ...`) and future systemd units easier.
+    /// (`hypresent status && ...`) and future systemd units easier.
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::NoHyprlandSignature => 2,
