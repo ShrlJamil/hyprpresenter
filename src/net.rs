@@ -520,6 +520,10 @@ fn handle_client(
 
     // -- Command phase ---------------------------------------------------------
     let mut last_activity = Instant::now();
+    // HP_MOVE_LOG=1 timestamps every incoming laser move (arrival
+    // smoothness diagnostics for the streaming path below).
+    let move_log = std::env::var_os("HP_MOVE_LOG").is_some();
+    let session_start = Instant::now();
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -532,12 +536,39 @@ fn handle_client(
         match read_result {
             Ok(Message::Text(text)) => match parse_request(&text) {
                 Ok(WsRequest::Cmd(command)) => {
+                    // Laser moves stream at ~50/s and are never
+                    // answered: waiting for each one's round trip
+                    // throttles this read loop to the render rate and
+                    // piles the stream into a stale queue the dot then
+                    // crawls through (visible stepping).  Moves are
+                    // fire-and-forget — the client never awaits their
+                    // replies, and skipping them keeps reply FIFO
+                    // alignment exact for the commands that do answer.
+                    if matches!(command, Command::Move(..)) {
+                        if move_log {
+                            eprintln!(
+                                "hypresent: hp-move t={}ms",
+                                session_start.elapsed().as_millis()
+                            );
+                        }
+                        if requests
+                            .send(ControlRequest {
+                                command,
+                                reply: None,
+                            })
+                            .is_err()
+                        {
+                            send_text(&mut ws, error_reply("overlay is shutting down"));
+                            return;
+                        }
+                        continue;
+                    }
                     let is_quit = matches!(command, Command::Quit);
                     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                     if requests
                         .send(ControlRequest {
                             command,
-                            reply: reply_tx,
+                            reply: Some(reply_tx),
                         })
                         .is_err()
                     {

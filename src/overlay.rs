@@ -378,7 +378,9 @@ fn send_control(command: &str) -> Result<()> {
 /// forward these into the event loop identically.
 pub(crate) struct ControlRequest {
     pub(crate) command: Command,
-    pub(crate) reply: mpsc::Sender<String>,
+    /// Where the reply goes; `None` marks a fire-and-forget command
+    /// (streaming laser moves over WebSocket) that is never answered.
+    pub(crate) reply: Option<mpsc::Sender<String>>,
 }
 
 /// Owns the control listener thread; dropping it stops the thread, wakes a
@@ -479,7 +481,7 @@ fn control_loop(
         if requests
             .send(ControlRequest {
                 command,
-                reply: reply_tx,
+                reply: Some(reply_tx),
             })
             .is_err()
         {
@@ -707,7 +709,9 @@ fn run_overlay(options: Options) -> Result<()> {
         .insert_source(request_rx, |event, _, app| {
             if let ChannelEvent::Msg(request) = event {
                 let reply = app.apply_command(request.command);
-                let _ = request.reply.send(reply);
+                if let Some(reply_tx) = &request.reply {
+                    let _ = reply_tx.send(reply);
+                }
             }
         })
         .map_err(|e| Error::Overlay(format!("failed to insert control channel: {e}")))?;
