@@ -136,15 +136,20 @@ green UI with its own launcher icon.
 Deliberately not there yet: auto-reconnect and wake lock in the app, a
 desktop configuration file, packaging, and a systemd unit.
 
-## Releases & updates (planned)
+## Releases & updates
 
 The app and the desktop share one version (currently **0.1.0**, shown
-at the bottom of the app's start screen). The planned OTA-style update
-checker will poll the GitHub Releases API
-(`repos/ShrlJamil/hyprpresenter/releases/latest`), compare the release
-tag (`vX.Y.Z`) against the installed version, and offer the release's
-APK asset for download and installation. The asset name is contractual
-and must stay exactly `app-arm64-v8a-release.apk` on every release.
+at the bottom of the app's start screen). Releases live on GitHub: each
+one carries the arm64 app as a single APK asset named
+**`hyprpresenter-arm64.apk`** (the name is contractual — the update
+checker looks for exactly it). Download it, open it, and Android
+installs it over the previous version.
+
+The app checks for updates itself: at start-up, and any time via
+**Check for updates** under the version label, it asks the GitHub
+Releases API for the latest release, compares its tag (`vX.Y.Z`) with
+the installed version, and — when a newer one exists — shows an
+**Update to vX.Y.Z** button that opens the APK download in the browser.
 
 ## Development
 

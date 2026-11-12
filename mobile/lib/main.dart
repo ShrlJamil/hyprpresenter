@@ -6,6 +6,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'desktop_status.dart';
 import 'notes.dart';
@@ -14,6 +15,7 @@ import 'gyro_pointer.dart';
 import 'pairing.dart';
 import 'presenter_connection.dart';
 import 'qr_scan_screen.dart';
+import 'update_check.dart';
 
 /// HyprPresenter mobile remote (Phase 6).
 ///
@@ -97,6 +99,10 @@ class _PairingGateState extends State<PairingGate> {
   /// value the planned update checker compares against the latest
   /// GitHub release tag.
   String? _version;
+
+  /// A newer release found by the update checker, if any.
+  UpdateInfo? _update;
+  bool _checkingUpdate = false;
   PairingValues? _stored;
   String? _error;
 
@@ -104,12 +110,45 @@ class _PairingGateState extends State<PairingGate> {
   void initState() {
     super.initState();
     _loadVersion();
+    _checkForUpdate();
     _boot();
   }
 
   Future<void> _loadVersion() async {
     final info = await PackageInfo.fromPlatform();
     if (mounted) setState(() => _version = info.version);
+  }
+
+  /// Check GitHub for a newer release.  Automatic checks stay silent
+  /// unless an update exists; a manual check always reports its
+  /// outcome (used by the "Check for updates" button).
+  Future<void> _checkForUpdate({bool manual = false}) async {
+    if (_checkingUpdate) return;
+    setState(() => _checkingUpdate = true);
+    final result = await checkForUpdate();
+    if (!mounted) return;
+    setState(() {
+      _checkingUpdate = false;
+      if (result.status == UpdateCheckStatus.updateAvailable) {
+        _update = result.info;
+      }
+    });
+    if (manual) {
+      final message = switch (result.status) {
+        UpdateCheckStatus.updateAvailable =>
+          'Update available: v${result.info!.version}',
+        UpdateCheckStatus.upToDate => "You're on the latest version",
+        UpdateCheckStatus.failed => "Couldn't check for updates",
+      };
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
+  Future<void> _openUpdate() async {
+    final url = _update?.downloadUrl;
+    if (url == null) return;
+    await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
   }
 
   Future<void> _boot() async {
@@ -199,13 +238,34 @@ class _PairingGateState extends State<PairingGate> {
                 onPressed: _openNotesEditor,
               ),
             ),
+            if (_update != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: FilledButton.tonalIcon(
+                  onPressed: _openUpdate,
+                  icon: const Icon(Icons.download, size: 18),
+                  label: Text('Update to v${_update!.version}'),
+                ),
+              ),
             Padding(
-              padding: const EdgeInsets.only(bottom: 14),
+              padding: const EdgeInsets.only(bottom: 2),
               child: Text(
                 _version == null ? '' : 'v$_version',
                 style: TextStyle(
                   fontSize: 11,
                   color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: TextButton(
+                onPressed: _checkingUpdate
+                    ? null
+                    : () => _checkForUpdate(manual: true),
+                child: Text(
+                  _checkingUpdate ? 'Checking…' : 'Check for updates',
+                  style: const TextStyle(fontSize: 12),
                 ),
               ),
             ),
