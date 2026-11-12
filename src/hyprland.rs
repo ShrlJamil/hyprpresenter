@@ -134,6 +134,54 @@ pub fn version() -> Result<Version> {
     serde_json::from_str(&reply).map_err(Error::InvalidJson)
 }
 
+/// Send a `dispatch …` command to the compositor (e.g.
+/// `dispatch("fullscreen 1")`); Hyprland answers `ok` on success.
+pub fn dispatch(command: &str) -> Result<String> {
+    request(&format!("dispatch {command}"))
+}
+
+/// Whether the active window is truly fullscreen, from
+/// `j/activewindow`.  `None` when no window is active (Hyprland then
+/// replies with an empty object).
+///
+/// The raw mode integer is ambiguous on Hyprland 0.57: mode 2 is the
+/// fullscreen this program sets, mode 0 is plainly windowed, but mode
+/// 1 is reported both for real fullscreen windows and for a lone
+/// column in the scrolling layout that still leaves gaps.  Geometry
+/// decides mode 1: a fullscreen window spans its whole output.
+pub fn active_window_is_fullscreen() -> Result<Option<bool>> {
+    #[derive(Deserialize)]
+    struct ActiveWindow {
+        fullscreen: Option<i64>,
+        size: Option<(i32, i32)>,
+        monitor: Option<i32>,
+    }
+    let reply = request("j/activewindow")?;
+    let window: ActiveWindow = serde_json::from_str(&reply).map_err(Error::InvalidJson)?;
+    let Some(mode) = window.fullscreen else {
+        return Ok(None);
+    };
+    match mode {
+        0 => Ok(Some(false)),
+        2 => Ok(Some(true)),
+        _ => {
+            let covers = match (window.size, window.monitor) {
+                (Some((w, h)), Some(mon)) => monitors()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|m| m.id == mon)
+                    .map(|m| {
+                        let (lw, lh) = m.logical_size();
+                        (lw as i32, lh as i32) == (w, h)
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            };
+            Ok(Some(covers))
+        }
+    }
+}
+
 /// `j/monitors` — used by `hypresent status` and, later, overlay placement.
 pub fn monitors() -> Result<Vec<Monitor>> {
     let reply = request("j/monitors")?;

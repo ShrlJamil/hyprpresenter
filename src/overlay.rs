@@ -130,6 +130,20 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             send_control(&format!("confine {}", args[1]))
         }
+        Some("fullscreen") => {
+            if args.len() > 2 {
+                return Err(Error::Overlay(
+                    "usage: hypresent overlay fullscreen [on|off]".into(),
+                ));
+            }
+            match args.get(1).map(String::as_str) {
+                None => send_control("fullscreen"),
+                Some(mode @ ("on" | "off")) => send_control(&format!("fullscreen {mode}")),
+                Some(other) => Err(Error::Overlay(format!(
+                    "fullscreen takes `on` or `off` (got `{other}`)"
+                ))),
+            }
+        }
         Some("status") => send_control("status"),
         Some("quit") => send_control("quit"),
         Some("-h") | Some("--help") => {
@@ -159,6 +173,7 @@ USAGE:
   hypresent overlay previous      send the previous key to the focused application
   hypresent overlay next          send the next key to the focused application
   hypresent overlay confine O|off keep the dot on output O (or release it)
+  hypresent overlay fullscreen [on|off]  fullscreen the active window (default: toggle)
   hypresent overlay quit          shut the overlay down cleanly
 
 OPTIONS:
@@ -343,7 +358,7 @@ fn control_socket_path() -> Result<PathBuf> {
     Ok(PathBuf::from(runtime).join("hyprpresenter-overlay.sock"))
 }
 
-fn send_control(command: &str) -> Result<()> {
+fn control_request(command: &str) -> Result<String> {
     let path = control_socket_path()?;
     let mut stream = UnixStream::connect(&path).map_err(|e| {
         Error::Overlay(format!(
@@ -369,8 +384,88 @@ fn send_control(command: &str) -> Result<()> {
     if reply.starts_with("error") {
         return Err(Error::Overlay(reply.to_string()));
     }
-    println!("{reply}");
+    Ok(reply.to_string())
+}
+
+fn send_control(command: &str) -> Result<()> {
+    println!("{}", control_request(command)?);
     Ok(())
+}
+
+/// True when an overlay already answers on the control socket.
+pub fn overlay_is_running() -> bool {
+    control_request("status").is_ok()
+}
+
+/// Where a background overlay's output goes: `$XDG_STATE_HOME` or
+/// `~/.local/state`, under `hyprpresenter/overlay.log`.
+fn overlay_log_path() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .ok_or_else(|| Error::Overlay("neither XDG_STATE_HOME nor HOME is set".into()))?;
+    Ok(base.join("hyprpresenter").join("overlay.log"))
+}
+
+/// Start this same binary as a detached overlay — its own process
+/// group, so it survives the terminal that launched it — with output
+/// appended to the log file.  Returns the log path.
+pub fn spawn_overlay_background() -> Result<PathBuf> {
+    use std::os::unix::process::CommandExt;
+    let log_path = overlay_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Overlay(format!("cannot create {}: {e}", parent.display())))?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| Error::Overlay(format!("cannot open {}: {e}", log_path.display())))?;
+    let err_log = log
+        .try_clone()
+        .map_err(|e| Error::Overlay(format!("cannot clone log file handle: {e}")))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| Error::Overlay(format!("cannot locate own executable: {e}")))?;
+    std::process::Command::new(exe)
+        .arg("overlay")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(err_log))
+        .process_group(0)
+        .spawn()
+        .map_err(|e| Error::Overlay(format!("cannot start the overlay: {e}")))?;
+    Ok(log_path)
+}
+
+/// Make sure an overlay is running, starting one in the background if
+/// needed, so a single `hypresent pair` is the whole setup.  Returns a
+/// one-line outcome for the caller to print; never fails — the worst
+/// case is advice to start the overlay manually.
+pub fn ensure_overlay() -> String {
+    if overlay_is_running() {
+        return "Overlay is already running.".to_string();
+    }
+    match spawn_overlay_background() {
+        Ok(log_path) => {
+            for _ in 0..40 {
+                if overlay_is_running() {
+                    return format!(
+                        "Overlay started in the background (log: {}).",
+                        log_path.display()
+                    );
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            format!(
+                "Overlay was started but is not answering yet — check the log: {}",
+                log_path.display()
+            )
+        }
+        Err(e) => format!(
+            "Could not start the overlay automatically ({e}). Run `hypresent overlay` manually."
+        ),
+    }
 }
 
 /// One parsed command plus the channel its reply goes to.  Shared by both
@@ -1071,6 +1166,36 @@ impl Overlay {
                 outcome.reply
             }
             Some(Action::Navigate(key)) => self.navigate(key),
+            Some(Action::Fullscreen(on)) => self.fullscreen(on),
+        }
+    }
+
+    /// Fullscreen or un-fullscreen the compositor's active window (the
+    /// presentation window) through Hyprland IPC.  Toggling reads the
+    /// current state from `j/activewindow` first.
+    ///
+    /// Hyprland 0.57 routes `dispatch` through its Lua bridge: the
+    /// argument must be a Lua dispatcher expression, so this sends
+    /// `hl.dsp.window.fullscreen({ action = "set", mode = "fullscreen" })`
+    /// / `{ action = "unset" }` — the classic `fullscreen 1` form is
+    /// rejected by the parser.
+    fn fullscreen(&mut self, on: Option<bool>) -> String {
+        let target = match on {
+            Some(value) => value,
+            None => match hyprland::active_window_is_fullscreen() {
+                Ok(Some(fullscreen)) => !fullscreen,
+                Ok(None) => return "error: no active window".to_string(),
+                Err(e) => return format!("error: {e}"),
+            },
+        };
+        let expr = if target {
+            r#"hl.dsp.window.fullscreen({ action = "set", mode = "fullscreen" })"#
+        } else {
+            r#"hl.dsp.window.fullscreen({ action = "unset" })"#
+        };
+        match hyprland::dispatch(expr) {
+            Ok(_) => format!("ok fullscreen={}", u8::from(target)),
+            Err(e) => format!("error: {e}"),
         }
     }
 

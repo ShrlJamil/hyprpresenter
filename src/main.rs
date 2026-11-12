@@ -63,7 +63,7 @@ USAGE:
   hypresent status       health check: Hyprland session, version, monitors
   hypresent probe        check which Wayland protocols the compositor offers
   hypresent overlay      run the laser overlay (`overlay --help` for controls)
-  hypresent pair         pair a phone (fresh QR + token; re-pairing rotates it)
+  hypresent pair         pair a phone (fresh QR + token; starts the overlay if needed)
   hypresent --version    print version
 
 The overlay serves paired phones over LAN WebSocket; the Android app

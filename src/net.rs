@@ -212,6 +212,13 @@ pub fn cmd_pair(args: &[String]) -> Result<()> {
     fs::write(&path, format!("{}\n", hash_token(&token)))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
+    // One command is the whole setup: make sure the overlay is up so
+    // the QR below can be scanned right away.  (The running overlay
+    // re-reads the hash file per connection, so a rotation applies to
+    // it immediately — no restart needed.)
+    println!("{}", crate::overlay::ensure_overlay());
+    println!();
+
     let grouped = token
         .as_bytes()
         .chunks(4)
@@ -270,6 +277,7 @@ struct WireRequest {
     y: Option<i32>,
     value: Option<i32>,
     color: Option<String>,
+    on: Option<bool>,
 }
 
 /// Decode one JSON text message into a [`WsRequest`], reusing the command
@@ -327,6 +335,7 @@ pub fn parse_request(text: &str) -> std::result::Result<WsRequest, String> {
                 }
             }
         }
+        "fullscreen" => Command::Fullscreen(wire.on),
         "previous" | "prev" => Command::Previous,
         "next" => Command::Next,
         "status" => Command::Status,
@@ -699,6 +708,18 @@ mod tests {
     #[test]
     fn rejects_bad_requests() {
         assert!(parse_request("not json").is_err());
+        assert_eq!(
+            parse_request(r#"{"cmd":"fullscreen"}"#),
+            Ok(WsRequest::Cmd(Command::Fullscreen(None)))
+        );
+        assert_eq!(
+            parse_request(r#"{"cmd":"fullscreen","on":true}"#),
+            Ok(WsRequest::Cmd(Command::Fullscreen(Some(true))))
+        );
+        assert_eq!(
+            parse_request(r#"{"cmd":"fullscreen","on":false}"#),
+            Ok(WsRequest::Cmd(Command::Fullscreen(Some(false))))
+        );
         assert!(parse_request(r#"{"v":2,"cmd":"next"}"#).is_err());
         assert!(parse_request(r#"{"type":"auth"}"#).is_err());
         assert!(parse_request(r#"{"cmd":"move","x":1}"#).is_err());

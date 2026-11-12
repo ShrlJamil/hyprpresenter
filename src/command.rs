@@ -324,6 +324,11 @@ pub enum Command {
     /// movement into that output and retargets `center` at it; `None`
     /// releases the dot to roam the whole layout again.
     Confine(Option<String>),
+    /// Fullscreen the compositor's **active window** (the presentation,
+    /// not the phone UI): `None` toggles, `Some(true/false)` sets it
+    /// explicitly.  Like navigation, it is an adapter side effect — the
+    /// core only records the intent.
+    Fullscreen(Option<bool>),
 }
 
 /// Parse the line-based command language used by the local control socket
@@ -372,6 +377,16 @@ pub fn parse_command(raw: &str) -> std::result::Result<Command, String> {
                 Command::Confine(Some(target.to_string()))
             }
         }
+        Some("fullscreen") => match parts.next() {
+            None => Command::Fullscreen(None),
+            Some("on") => Command::Fullscreen(Some(true)),
+            Some("off") => Command::Fullscreen(Some(false)),
+            Some(other) => {
+                return Err(format!(
+                    "fullscreen takes `on`, `off`, or no argument (got `{other}`)"
+                ));
+            }
+        },
         Some(other) => return Err(format!("unknown command `{other}`")),
         None => return Err("empty command".to_string()),
     };
@@ -387,6 +402,9 @@ pub fn parse_command(raw: &str) -> std::result::Result<Command, String> {
 pub enum Action {
     /// Inject a presentation key through the input adapter.
     Navigate(PresentationKey),
+    /// Fullscreen (`Some(true)`), un-fullscreen (`Some(false)`), or
+    /// toggle (`None`) the compositor's active window via IPC.
+    Fullscreen(Option<bool>),
     /// Shut the overlay down cleanly.
     Quit,
 }
@@ -517,6 +535,11 @@ impl LaserState {
                 self.appearance.color = color;
                 Outcome::plain(format!("ok color={}", color.to_hex()), redraw)
             }
+            Command::Fullscreen(on) => Outcome {
+                reply: String::new(),
+                redraw: false,
+                action: Some(Action::Fullscreen(on)),
+            },
             Command::Previous => Outcome {
                 reply: String::new(),
                 redraw: false,
@@ -599,6 +622,21 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_is_an_adapter_action_with_no_core_reply() {
+        // The core cannot talk to the compositor; like navigation, a
+        // fullscreen command must surface as an Action with an empty
+        // reply for the adapter to complete.
+        let layout = real_layout();
+        let mut state = LaserState::default();
+        let out = state.apply(Command::Fullscreen(None), &layout);
+        assert_eq!(out.action, Some(Action::Fullscreen(None)));
+        assert_eq!(out.reply, "");
+        assert!(!out.redraw);
+        let out = state.apply(Command::Fullscreen(Some(true)), &layout);
+        assert_eq!(out.action, Some(Action::Fullscreen(Some(true))));
+    }
+
+    #[test]
     fn confinement_clamps_moves_and_retargets_center() {
         let layout = real_layout();
         let mut state = LaserState::default();
@@ -639,6 +677,16 @@ mod tests {
             Ok(Command::Confine(Some("DP-1".to_string())))
         );
         assert_eq!(parse_command("confine off"), Ok(Command::Confine(None)));
+        assert_eq!(parse_command("fullscreen"), Ok(Command::Fullscreen(None)));
+        assert_eq!(
+            parse_command("fullscreen on"),
+            Ok(Command::Fullscreen(Some(true)))
+        );
+        assert_eq!(
+            parse_command("fullscreen off"),
+            Ok(Command::Fullscreen(Some(false)))
+        );
+        assert!(parse_command("fullscreen wide").is_err());
     }
 
     #[test]
