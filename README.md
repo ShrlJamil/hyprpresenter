@@ -25,7 +25,7 @@ built into the pad's header.
 
 ## Setup
 
-### 1. Install and run the desktop overlay
+### 1. Install
 
 ```sh
 git clone https://github.com/ShrlJamil/hyprpresenter
@@ -40,29 +40,30 @@ know Rust yourself; it is only the build tool. (Manual equivalent:
 `cargo build --release`, then link or copy `target/release/hypresent`
 somewhere on your PATH.)
 
-Then start the overlay:
+(The binary is called `hypresent`; the project, repository, and config
+paths keep the `hyprpresenter` name.)
 
-```sh
-hypresent overlay
-```
-
-The overlay draws on every monitor, starts its WebSocket server on port
-**8423**, and waits for a paired phone. Leave it running. (The binary is
-called `hypresent`; the project, repository, and config paths keep the
-`hyprpresenter` name.)
-
-### 2. Pair the phone
-
-In another terminal:
+### 2. Pair the phone — this also starts the overlay
 
 ```sh
 hypresent pair
 ```
 
-This prints a QR code in the terminal and stores the pairing token — only
-its SHA-256 hash is kept, at `~/.config/hyprpresenter/pairing.sha256`
-(mode 0600). **Re-running `pair` rotates the token**: previously paired
-phones stop working immediately and must scan the new code.
+One command is the whole setup: `pair` stores the pairing token and
+prints the QR code — and if the overlay is not running yet, it starts
+it in the background first (detached from the terminal; its log lands
+in `~/.local/state/hyprpresenter/overlay.log`). The overlay draws on
+every monitor and serves paired phones on WebSocket port **8423**.
+
+Only the token's SHA-256 hash is stored, at
+`~/.config/hyprpresenter/pairing.sha256` (mode 0600). **Re-running
+`pair` rotates the token**: previously paired phones stop working
+immediately and must scan the new code — a running overlay picks the
+new hash up at once, no restart needed.
+
+Running the overlay yourself is optional: `hypresent overlay` keeps it
+in the foreground (handy for debugging), and
+`hypresent overlay quit` stops a background one.
 
 ### 3. Build and install the Android app
 
@@ -88,6 +89,10 @@ launches.
 
 - **Slides** — *Previous* / *Next* send PageUp/PageDown to the focused
   application on the desktop.
+- **Fullscreen** — the small icon at the clicker's top-left (opposite
+  the disconnect icon) toggles fullscreen on the desktop's **active
+  window** — your presentation, not the phone app. The desktop drives
+  Hyprland's own fullscreen, so it works with any application.
 - **Laser** — press and hold the big pad: the dot appears at the centre
   of the active monitor and follows where you aim the **top edge of the
   phone** (lean it left/right, nod it up/down). Release hides the dot;
@@ -130,6 +135,16 @@ green UI with its own launcher icon.
 
 Deliberately not there yet: auto-reconnect and wake lock in the app, a
 desktop configuration file, packaging, and a systemd unit.
+
+## Releases & updates (planned)
+
+The app and the desktop share one version (currently **0.1.0**, shown
+at the bottom of the app's start screen). The planned OTA-style update
+checker will poll the GitHub Releases API
+(`repos/ShrlJamil/hyprpresenter/releases/latest`), compare the release
+tag (`vX.Y.Z`) against the installed version, and offer the release's
+APK asset for download and installation. The asset name is contractual
+and must stay exactly `app-arm64-v8a-release.apk` on every release.
 
 ## Development
 
@@ -477,7 +492,19 @@ logical):
 {"v": 1, "cmd": "previous"} {"v": 1, "cmd": "next"}
 {"v": 1, "cmd": "status"}   {"v": 1, "cmd": "quit"}
 {"v": 1, "cmd": "confine", "output": "DP-1"}   {"v": 1, "cmd": "confine", "output": null}
+{"v": 1, "cmd": "fullscreen"}   {"v": 1, "cmd": "fullscreen", "on": true}
 ```
+
+The `fullscreen` command fullscreens the compositor's active window
+(the presentation): no `on` field toggles, `"on": true/false` sets it
+explicitly, and the reply reports the result as `ok fullscreen=1|0`.
+On Hyprland 0.57 the overlay dispatches it through the Lua bridge
+(`hl.dsp.window.fullscreen({ action = "set", mode = "fullscreen" })` /
+`{ action = "unset" }`) — the classic `dispatch fullscreen 1` form is
+rejected by that version's parser. Toggle state is read from
+`j/activewindow`; its mode integer is ambiguous there (the scrolling
+layout reports a lone column as mode 1), so mode 1 is only treated as
+fullscreen when the window spans its whole output.
 
 The `confine` command (Phase 6.2) pins the laser to one output: moves
 clamp into that output (inset by the dot radius) and `center` targets it;

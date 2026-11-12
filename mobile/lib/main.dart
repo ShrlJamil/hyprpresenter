@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -91,13 +92,24 @@ class PairingGate extends StatefulWidget {
 class _PairingGateState extends State<PairingGate> {
   PresenterConnection get _conn => widget.connection;
   _GatePhase _phase = _GatePhase.loading;
+
+  /// This build's version ("0.1.0") from the package metadata — the
+  /// value the planned update checker compares against the latest
+  /// GitHub release tag.
+  String? _version;
   PairingValues? _stored;
   String? _error;
 
   @override
   void initState() {
     super.initState();
+    _loadVersion();
     _boot();
+  }
+
+  Future<void> _loadVersion() async {
+    final info = await PackageInfo.fromPlatform();
+    if (mounted) setState(() => _version = info.version);
   }
 
   Future<void> _boot() async {
@@ -179,12 +191,22 @@ class _PairingGateState extends State<PairingGate> {
               ),
             ),
             Padding(
-              padding: const EdgeInsets.only(bottom: 24),
+              padding: const EdgeInsets.only(bottom: 6),
               child: IconButton.filledTonal(
                 icon: const Icon(Icons.sticky_note_2_outlined),
                 iconSize: 28,
                 tooltip: 'Slide notes',
                 onPressed: _openNotesEditor,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 14),
+              child: Text(
+                _version == null ? '' : 'v$_version',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
             ),
           ],
@@ -270,6 +292,19 @@ class _ClickerPageState extends State<ClickerPage> {
 
   List<String> _notes = <String>[];
   int _slide = 1;
+
+  /// Whether we believe the desktop's active window is fullscreen;
+  /// drives the toggle icon at the top-left of the clicker.  Flipped
+  /// optimistically on each tap (the server performs the toggle).
+  bool _fullscreen = false;
+
+  void _toggleFullscreen() {
+    // The fullscreen target is the DESKTOP's active window (the
+    // presentation), not this app: the icon flips optimistically and
+    // the server toggles the window through Hyprland IPC.
+    setState(() => _fullscreen = !_fullscreen);
+    _conn.fullscreen().ignore();
+  }
 
   final GyroPointer _gyro = GyroPointer();
   StreamSubscription<GyroscopeEvent>? _gyroSub;
@@ -575,6 +610,11 @@ class _ClickerPageState extends State<ClickerPage> {
     final scheme = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          icon: Icon(_fullscreen ? Icons.fullscreen_exit : Icons.fullscreen),
+          tooltip: _fullscreen ? 'Exit full screen' : 'Full screen',
+          onPressed: _toggleFullscreen,
+        ),
         actions: [
           IconButton(
             icon: const Icon(Icons.link_off),

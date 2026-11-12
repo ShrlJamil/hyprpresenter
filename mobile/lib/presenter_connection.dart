@@ -147,6 +147,11 @@ class PresenterConnection extends ChangeNotifier {
   Future<String> confineTo(String? outputName) =>
       requestReply({'cmd': 'confine', 'output': outputName});
 
+  /// Fullscreen the desktop's active window (the presentation).
+  /// [on] null toggles; the reply reports the resulting state.
+  Future<String> fullscreen({bool? on}) =>
+      requestReply({'cmd': 'fullscreen', 'on': ?on});
+
   // -- internals --------------------------------------------------------------
 
   void _sendRaw(Map<String, dynamic> message) {
