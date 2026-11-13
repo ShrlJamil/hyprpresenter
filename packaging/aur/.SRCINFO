@@ -1,0 +1,15 @@
+pkgbase = hyprpresenter
+	pkgdesc = Presentation remote for Hyprland. Your Android phone becomes the clicker, with a gyro laser pointer, over your LAN
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/ShrlJamil/hyprpresenter
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = pkgconf
+	depends = wayland
+	depends = libxkbcommon
+	source = hyprpresenter-0.1.0.tar.gz::https://github.com/ShrlJamil/hyprpresenter/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 50692d27241c8e94b62fcb7f089bf8cee216e7e24b11d706d984c949765d55ff
+
+pkgname = hyprpresenter
