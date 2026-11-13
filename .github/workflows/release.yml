@@ -1,0 +1,104 @@
+name: Release
+
+# Push a version tag (e.g. v0.2.0) to build the Android APK and the
+# desktop binary and publish them as a GitHub Release automatically.
+# The tag must match the versions in Cargo.toml and mobile/pubspec.yaml.
+# Manual runs (workflow_dispatch) only build the artifacts, no release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.5"
+          cache: true
+      - name: Check the tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: mobile
+        run: |
+          APP_VERSION=$(grep '^version: ' pubspec.yaml | sed 's/version: //' | cut -d+ -f1)
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$APP_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match pubspec version $APP_VERSION" >&2
+            exit 1
+          fi
+      - name: Build the release APK
+        working-directory: mobile
+        run: |
+          flutter pub get
+          flutter build apk --release --split-per-abi --obfuscate --split-debug-info=build/debug-info
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk hyprpresenter-arm64.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: mobile/hyprpresenter-arm64.apk
+
+  build-desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Wayland development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          CRATE_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$CRATE_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $CRATE_VERSION" >&2
+            exit 1
+          fi
+      - name: Build the release binary
+        run: cargo build --release --locked
+      - name: Package the binary
+        run: |
+          mkdir -p dist/hypresent
+          cp target/release/hypresent dist/hypresent/
+          cp README.md LICENSE dist/hypresent/
+          tar -C dist -czf hypresent-linux-x86_64.tar.gz hypresent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop
+          path: hypresent-linux-x86_64.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-apk, build-desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            hyprpresenter-arm64.apk
+            hypresent-linux-x86_64.tar.gz
+          body: |
+            ## Install
+
+            **Desktop (Hyprland):** download `hypresent-linux-x86_64.tar.gz`,
+            extract it, and put the `hypresent` binary somewhere on your PATH,
+            or build from source with `./install.sh`.
+
+            **Android:** download `hyprpresenter-arm64.apk` and install it.
+            The app checks this page for future updates itself.
+
+            Then run `hypresent pair` on the desktop and scan the QR code.
