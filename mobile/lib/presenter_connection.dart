@@ -1,11 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 
 /// Connection lifecycle as the UI presents it.
-enum LinkState { disconnected, connecting, authenticating, ready, failed }
+enum LinkState {
+  disconnected,
+  connecting,
+  authenticating,
+  ready,
+  failed,
+  reconnecting,
+}
 
 /// Speaks HyprPresenter protocol v1 (see the desktop README) to the overlay's
 /// WebSocket server: JSON messages in, JSON envelope replies out, with the
@@ -14,6 +22,12 @@ enum LinkState { disconnected, connecting, authenticating, ready, failed }
 /// Plain `dart:io` WebSocket on purpose — the protocol is tiny and needs no
 /// extra dependency.  A 5 s client ping interval keeps the session alive
 /// through the server's ping/pong handling.
+///
+/// A dropped link reconnects automatically: while the user has not asked
+/// to disconnect, transport failures retry with exponential backoff
+/// (1 s, doubling to a 30 s cap) until the server answers again.  Only an
+/// authentication rejection stops the retries — re-pairing rotates the
+/// token, so a rejected one will never succeed and the user must re-pair.
 class PresenterConnection extends ChangeNotifier {
   WebSocket? _socket;
   StreamSubscription<dynamic>? _sub;
@@ -26,69 +40,141 @@ class PresenterConnection extends ChangeNotifier {
   bool get isReady => state == LinkState.ready;
   bool get isBusy =>
       state == LinkState.connecting || state == LinkState.authenticating;
+  bool get isReconnecting => state == LinkState.reconnecting;
 
-  /// Connect and authenticate.  Returns true when the session is ready for
-  /// commands; on failure [state] is [LinkState.failed] and [error] says why.
+  // -- auto-reconnect bookkeeping --------------------------------------------
+
+  String? _host;
+  int? _port;
+  String? _token;
+
+  /// The user's standing intent to be linked: set by [connect], cleared
+  /// only by an explicit [disconnect].  Transport failures retry while
+  /// this is set; a manual disconnect is never second-guessed.
+  bool _wantConnected = false;
+
+  /// Bumped by every [connect]/[disconnect], so an attempt that finishes
+  /// late (its socket finally opened after the user moved on) can tell
+  /// it has been superseded and quietly close instead of resurrecting a
+  /// session nobody wants anymore.
+  int _gen = 0;
+
+  /// True between sending the auth message and handling its reply.
+  /// Tracked separately from [state] because a reconnect attempt keeps
+  /// [state] at [LinkState.reconnecting] through its auth phase too.
+  bool _authPending = false;
+
+  Timer? _retryTimer;
+  int _retryAttempt = 0;
+
+  /// How many reconnect attempts have been scheduled since the drop
+  /// (0 while the link is healthy); the UI shows it as progress.
+  int get reconnectAttempt => _retryAttempt;
+
+  /// Connect and authenticate.  Returns true when the session is ready
+  /// for commands.  On a transport failure it returns false and the
+  /// state becomes [LinkState.reconnecting] while the backoff loop keeps
+  /// trying in the background — a later success flips the state to
+  /// [LinkState.ready], which listeners can act on.  Only an
+  /// authentication rejection lands in [LinkState.failed] for good.
   Future<bool> connect({
     required String host,
     required int port,
     required String token,
   }) async {
-    await disconnect();
-    state = LinkState.connecting;
+    _host = host;
+    _port = port;
+    _token = token;
+    _wantConnected = true;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _retryAttempt = 0;
+    final gen = ++_gen;
+    return _attempt(gen);
+  }
+
+  /// One connect + authenticate round against the stored target.
+  Future<bool> _attempt(int gen) async {
+    await _closeSocket();
+    if (gen != _gen) return false;
+    state = _retryAttempt > 0 ? LinkState.reconnecting : LinkState.connecting;
     error = null;
     lastReply = null;
-    serverLabel = 'ws://$host:$port';
+    serverLabel = 'ws://$_host:$_port';
     notifyListeners();
     try {
       final socket = await WebSocket.connect(serverLabel)
           .timeout(const Duration(seconds: 8));
+      if (gen != _gen) {
+        socket.close().ignore();
+        return false;
+      }
       _socket = socket;
       socket.pingInterval = const Duration(seconds: 5);
-      state = LinkState.authenticating;
-      notifyListeners();
+      if (_retryAttempt == 0) {
+        state = LinkState.authenticating;
+        notifyListeners();
+      }
 
       final authResult = Completer<bool>();
       _sub = socket.listen(
         (data) => _onMessage(data, authResult),
         onError: (Object e) {
           if (!authResult.isCompleted) authResult.complete(false);
-          _fail('connection error: $e');
+          if (gen == _gen) _fail('connection error: $e');
         },
         onDone: () {
           if (!authResult.isCompleted) authResult.complete(false);
-          _fail('connection closed');
+          if (gen == _gen) _fail('connection closed');
         },
       );
-      _sendRaw({'v': 1, 'type': 'auth', 'token': token});
+      _authPending = true;
+      _sendRaw({'v': 1, 'type': 'auth', 'token': _token});
       final ok = await authResult.future.timeout(
         const Duration(seconds: 8),
         onTimeout: () => false,
       );
+      if (gen != _gen) return false;
       if (ok) {
+        _retryAttempt = 0;
         state = LinkState.ready;
         notifyListeners();
+      } else if (_authPending) {
+        // Nobody failed this attempt on our behalf (an auth rejection
+        // or a socket error would have): the server never answered.
+        _authPending = false;
+        _fail('authentication timed out');
       }
       return ok;
     } catch (e) {
-      _fail('cannot reach $serverLabel — $e');
+      if (gen == _gen) _fail('cannot reach $serverLabel — $e');
       return false;
     }
   }
 
   Future<void> disconnect() async {
+    _wantConnected = false;
+    _gen++;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _retryAttempt = 0;
+    await _closeSocket();
+    if (state != LinkState.disconnected) {
+      state = LinkState.disconnected;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _closeSocket() async {
+    _authPending = false;
     await _sub?.cancel();
     _sub = null;
     try {
       await _socket?.close();
     } catch (_) {
-      // Already gone; disconnect must never throw into the UI.
+      // Already gone; closing must never throw into the UI.
     }
     _socket = null;
-    if (state != LinkState.disconnected) {
-      state = LinkState.disconnected;
-      notifyListeners();
-    }
   }
 
   // -- protocol v1 commands -------------------------------------------------
@@ -159,8 +245,8 @@ class PresenterConnection extends ChangeNotifier {
       _socket?.add(jsonEncode(message));
     } catch (e) {
       // A dead socket must not throw into gesture handlers (the laser
-      // button sends from a pointer callback): flip the state to failed
-      // so the UI stops trusting the link and the user can reconnect.
+      // button sends from a pointer callback): fail the link so the UI
+      // stops trusting it and the auto-reconnect backoff takes over.
       if (state == LinkState.ready || state == LinkState.authenticating) {
         _fail('connection lost: $e');
       }
@@ -176,14 +262,17 @@ class PresenterConnection extends ChangeNotifier {
       return; // Not a protocol reply; nothing the UI can do with it.
     }
     final ok = reply['ok'] == true;
-    if (state == LinkState.authenticating) {
+    if (_authPending) {
+      _authPending = false;
       if (ok) {
         lastReply = 'authenticated';
         if (!authResult.isCompleted) authResult.complete(true);
       } else {
         error = reply['error']?.toString() ?? 'authentication failed';
         if (!authResult.isCompleted) authResult.complete(false);
-        _fail(error!);
+        // A rejected token will never start working again (re-pairing
+        // rotates it), so this failure is terminal: no auto-reconnect.
+        _fail(error!, retryable: false);
       }
       return;
     }
@@ -196,9 +285,9 @@ class PresenterConnection extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _fail(String message) {
+  void _fail(String message, {bool retryable = true}) {
     error = message;
-    state = LinkState.failed;
+    _authPending = false;
     for (final completer in _pendingReplies) {
       if (!completer.isCompleted) completer.complete('error: $message');
     }
@@ -208,11 +297,39 @@ class PresenterConnection extends ChangeNotifier {
     _sub?.cancel();
     _sub = null;
     socket?.close().ignore();
+    if (retryable && _wantConnected) {
+      state = LinkState.reconnecting;
+      _scheduleRetry();
+    } else {
+      state = LinkState.failed;
+    }
     notifyListeners();
+  }
+
+  /// Exponential backoff between reconnect attempts: 1 s, 2 s, 4 s,
+  /// 8 s, 16 s, then a 30 s cap for as long as the user still wants
+  /// the link.  The server takes one client at a time and queues new
+  /// connections in its TCP backlog, so a slow cadence is never what
+  /// keeps a recovering session waiting.
+  void _scheduleRetry() {
+    _retryTimer?.cancel();
+    _retryAttempt++;
+    final delay = Duration(
+      seconds: math.min(30, 1 << math.min(_retryAttempt - 1, 5)),
+    );
+    final gen = _gen;
+    _retryTimer = Timer(delay, () {
+      _retryTimer = null;
+      if (gen != _gen || !_wantConnected) return;
+      _attempt(gen);
+    });
   }
 
   @override
   void dispose() {
+    _wantConnected = false;
+    _gen++;
+    _retryTimer?.cancel();
     _sub?.cancel();
     _socket?.close().ignore();
     super.dispose();

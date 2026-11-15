@@ -7,6 +7,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'desktop_status.dart';
 import 'notes.dart';
@@ -46,7 +47,36 @@ class _HyprPresenterAppState extends State<HyprPresenterApp> {
   late final PresenterConnection _connection = PresenterConnection();
 
   @override
+  void initState() {
+    super.initState();
+    _connection.addListener(_syncWakeLock);
+    _syncWakeLock();
+  }
+
+  /// Wake lock (Phase 6.3): the phone is a presentation remote, so the
+  /// screen must not sleep while a session is wanted — connecting,
+  /// authenticating, presenting, or waiting out a reconnect backoff.
+  /// It releases the moment the user disconnects or the link fails for
+  /// good, so a forgotten app never holds the screen on.
+  void _syncWakeLock() {
+    final hold = switch (_connection.state) {
+      LinkState.connecting ||
+      LinkState.authenticating ||
+      LinkState.ready ||
+      LinkState.reconnecting => true,
+      LinkState.disconnected || LinkState.failed => false,
+    };
+    if (hold) {
+      WakelockPlus.enable().ignore();
+    } else {
+      WakelockPlus.disable().ignore();
+    }
+  }
+
+  @override
   void dispose() {
+    _connection.removeListener(_syncWakeLock);
+    WakelockPlus.disable().ignore();
     _connection.dispose();
     super.dispose();
   }
@@ -109,9 +139,43 @@ class _PairingGateState extends State<PairingGate> {
   @override
   void initState() {
     super.initState();
+    _conn.addListener(_onLinkChanged);
     _loadVersion();
     _checkForUpdate();
     _boot();
+  }
+
+  @override
+  void dispose() {
+    _conn.removeListener(_onLinkChanged);
+    super.dispose();
+  }
+
+  bool _toClicker = false;
+
+  /// Navigate to the clicker exactly once, whichever path gets there
+  /// first: the connect() future or the link listener below.
+  Future<void> _goToClicker() async {
+    if (_toClicker || !mounted) return;
+    _toClicker = true;
+    await Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => ClickerPage(connection: _conn)),
+    );
+    _toClicker = false;
+    if (mounted) _boot();
+  }
+
+  /// Auto-reconnect can turn the link ready long after _connect()
+  /// returned failure (the gate is already showing its failed phase
+  /// then); follow the link instead of stranding the user there.  Any
+  /// other change just refreshes the status line.
+  void _onLinkChanged() {
+    if (!mounted) return;
+    if (_conn.isReady) {
+      _goToClicker();
+    } else {
+      setState(() {});
+    }
   }
 
   Future<void> _loadVersion() async {
@@ -181,10 +245,7 @@ class _PairingGateState extends State<PairingGate> {
     );
     if (!mounted) return;
     if (ok) {
-      await Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => ClickerPage(connection: _conn)),
-      );
-      if (mounted) _boot();
+      await _goToClicker();
     } else {
       setState(() {
         _phase = _GatePhase.failed;
@@ -296,6 +357,25 @@ class _PairingGateState extends State<PairingGate> {
             ),
             const SizedBox(height: 20),
           ],
+          if (_phase == _GatePhase.failed &&
+              _conn.state == LinkState.reconnecting) ...[
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  'Reconnecting automatically… '
+                  '(attempt ${_conn.reconnectAttempt})',
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+          ],
           if (_stored != null && !widget.autoConnect) ...[
             SizedBox(
               width: double.infinity,
@@ -358,6 +438,10 @@ class _ClickerPageState extends State<ClickerPage> {
   /// optimistically on each tap (the server performs the toggle).
   bool _fullscreen = false;
 
+  /// The link state as this page last saw it, for edge detection: a
+  /// reconnect shows up as a not-ready -> ready transition.
+  bool _linkReady = false;
+
   void _toggleFullscreen() {
     // The fullscreen target is the DESKTOP's active window (the
     // presentation), not this app: the icon flips optimistically and
@@ -393,6 +477,8 @@ class _ClickerPageState extends State<ClickerPage> {
   @override
   void initState() {
     super.initState();
+    _linkReady = _conn.isReady;
+    _conn.addListener(_onLinkChanged);
     _gyroSub = gyroscopeEventStream(samplingPeriod: SensorInterval.gameInterval)
         .listen(
           (e) => _gyro.addGyroscope(e.x, e.y, e.z, e.timestamp),
@@ -410,10 +496,35 @@ class _ClickerPageState extends State<ClickerPage> {
 
   @override
   void dispose() {
+    _conn.removeListener(_onLinkChanged);
     _laserTimer?.cancel();
     _gyroSub?.cancel();
     _accelSub?.cancel();
     super.dispose();
+  }
+
+  /// Watch for the link coming back after an auto-reconnect: the new
+  /// server session starts from scratch (dot visible again, no
+  /// confinement), so re-apply this page's session state.
+  void _onLinkChanged() {
+    final ready = _conn.isReady;
+    if (ready && !_linkReady) {
+      _linkReady = true;
+      _onReconnected();
+    } else {
+      _linkReady = ready;
+    }
+  }
+
+  Future<void> _onReconnected() async {
+    _laserUp();
+    _conn.hide();
+    final wantConfine = _confined;
+    _autoConfinedOnce = false;
+    await _refreshStatus();
+    if (wantConfine != null && _confined != wantConfine) {
+      await _pickConfine(wantConfine);
+    }
   }
 
   Future<void> _loadNotes() async {
@@ -689,6 +800,26 @@ class _ClickerPageState extends State<ClickerPage> {
             AnimatedBuilder(
               animation: _conn,
               builder: (context, _) {
+                if (_conn.state == LinkState.reconnecting) {
+                  return Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                    child: Row(
+                      children: [
+                        const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          'Connection lost — reconnecting… '
+                          '(attempt ${_conn.reconnectAttempt})',
+                          style: TextStyle(color: scheme.onSurfaceVariant),
+                        ),
+                      ],
+                    ),
+                  );
+                }
                 final reply = _conn.lastReply ?? '';
                 if (!reply.startsWith('error')) {
                   return const SizedBox.shrink();
