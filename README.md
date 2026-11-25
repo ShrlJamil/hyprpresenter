@@ -10,10 +10,12 @@ pocket and draw a laser dot on your screen instead of on the wall.
 ## Preview
 
 <img src="docs/preview-clicker.jpg" alt="The HyprPresenter phone app: slide notes on top, Previous/Next in the middle, and the laser pad with its monitor selector below" width="320">
+<img src="docs/preview-notes.jpg" alt="The HyprPresenter notes page: every slide's notes as numbered cards, with import and export in the app bar" width="320">
 
 The phone app: per-slide presenter notes on top, Previous/Next in the
 middle, and the hold-to-aim laser pad below, with the monitor selector
-built into the pad's header.
+built into the pad's header. The notes page keeps every slide's notes
+as numbered cards, ready to review and trim before the talk.
 
 ## What you need
 
