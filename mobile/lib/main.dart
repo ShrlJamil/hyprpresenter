@@ -87,8 +87,15 @@ class _HyprPresenterAppState extends State<HyprPresenterApp> {
       title: 'HyprPresenter',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.green,
+          seedColor: const Color(0xFF00A8F4),
           brightness: Brightness.dark,
+        ).copyWith(
+          surface: const Color(0xFF0E1319),
+          surfaceContainerLowest: const Color(0xFF090D12),
+          surfaceContainerLow: const Color(0xFF12181F),
+          surfaceContainer: const Color(0xFF151C24),
+          surfaceContainerHigh: const Color(0xFF1B242E),
+          surfaceContainerHighest: const Color(0xFF232E3A),
         ),
         useMaterial3: true,
       ),
@@ -880,8 +887,8 @@ class _ClickerPageState extends State<ClickerPage> {
                 child: Container(
                   decoration: BoxDecoration(
                     color: _laserHeld
-                        ? Colors.green.shade600
-                        : Colors.green.shade900,
+                        ? Color(0xFF00A8F4)
+                        : Color(0xFF0B3553),
                     borderRadius: BorderRadius.circular(28),
                   ),
                   child: Column(
@@ -900,7 +907,7 @@ class _ClickerPageState extends State<ClickerPage> {
                               DropdownButton<String?>(
                                 value: _confined,
                                 underline: const SizedBox.shrink(),
-                                dropdownColor: Colors.green.shade800,
+                                dropdownColor: Color(0xFF10344C),
                                 iconEnabledColor: Colors.white70,
                                 style: const TextStyle(
                                   color: Colors.white,

@@ -1,6 +1,6 @@
 # Maintainer: Sahrul Jamil <sahruljamil2@gmail.com>
 pkgname=hyprpresenter
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Presentation remote for Hyprland. Your Android phone becomes the clicker, with a gyro laser pointer, over your LAN"
 arch=('x86_64')
