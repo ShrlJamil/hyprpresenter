@@ -22,28 +22,36 @@ as numbered cards, ready to review and trim before the talk.
 - A Linux machine running [Hyprland](https://hypr.land) (tested on
   0.57.1) — it hosts the laser overlay and receives the phone's commands.
 - An Android phone on the **same local network** as the machine.
-- To build from source: Rust 1.80+ for the desktop program, Flutter 3.x
-  with the Android SDK for the app.
+- Only for the build-from-source route: Rust 1.80+ for the desktop
+  program, Flutter 3.x with the Android SDK for the app.
 
 ## Setup
 
-### 1. Install
+### 1. Install — from the latest release
 
-```sh
-git clone https://github.com/ShrlJamil/hyprpresenter
-cd hyprpresenter
-./install.sh
-```
+Grab the two files from the
+[latest release](https://github.com/ShrlJamil/hyprpresenter/releases/latest):
 
-The installer builds the release binary and symlinks it into
-`~/.local/bin`, so from then on `hypresent` works from any terminal. If
-Rust is missing it offers to install it via rustup — you never need to
-know Rust yourself; it is only the build tool. (Manual equivalent:
-`cargo build --release`, then link or copy `target/release/hypresent`
-somewhere on your PATH.)
+- **Desktop:** `hypresent-linux-x86_64.tar.gz` — unpack it and put the
+  `hypresent` binary somewhere on your `PATH`:
+
+  ```sh
+  tar -xzf hypresent-linux-x86_64.tar.gz
+  mkdir -p ~/.local/bin
+  cp hypresent/hypresent ~/.local/bin/
+  ```
+
+- **Phone:** `hyprpresenter-arm64.apk` — copy it to the phone, open
+  it, and let Android install it (about 24 MB). The first time,
+  Android asks you to allow installs from the app you opened the file
+  with; that is a one-time switch.
 
 (The binary is called `hypresent`; the project, repository, and config
 paths keep the `hyprpresenter` name.)
+
+Prefer building everything yourself? See
+[Building from source](#building-from-source) below — the release
+route above is the recommended one.
 
 ### 2. Pair the phone — this also starts the overlay
 
@@ -67,25 +75,43 @@ Running the overlay yourself is optional: `hypresent overlay` keeps it
 in the foreground (handy for debugging), and
 `hypresent overlay quit` stops a background one.
 
-### 3. Build and install the Android app
-
-```sh
-cd mobile
-flutter build apk --release --split-per-abi
-adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
-```
-
-Install the `arm64-v8a` build on any modern phone (about 24 MB); copying
-the APK over and opening it on the phone works just as well. Release
-builds are currently signed with the debug key — fine for installing on
-your own phone, not a distribution build.
-
-### 4. Connect
+### 3. Connect
 
 Open the app and tap **Scan QR**, then point the camera at the terminal
 QR code from step 2. That is the whole pairing flow — nothing to type.
 The app remembers the pairing and reconnects automatically on later
 launches.
+
+## Building from source
+
+Only if you want to: the release route above is the normal way to
+install HyprPresenter.
+
+```sh
+git clone https://github.com/ShrlJamil/hyprpresenter
+cd hyprpresenter
+./install.sh
+```
+
+The installer builds the desktop binary and symlinks it into
+`~/.local/bin`. If Rust is missing it offers to install it via rustup —
+you never need to know Rust yourself; it is only the build tool.
+(Manual equivalent: `cargo build --release`, then link or copy
+`target/release/hypresent` somewhere on your PATH.)
+
+For the phone app:
+
+```sh
+cd mobile
+flutter build apk --release
+adb install -r build/app/outputs/flutter-apk/app-release.apk
+```
+
+Copying the APK to the phone and opening it there works just as well.
+Without your own `mobile/android/key.properties`, a source build is
+signed with the debug key: fine on your own phone, but it cannot
+update a release-signed install (or the other way round) — Android
+refuses to mix signing keys.
 
 ## Using it
 
@@ -133,25 +159,29 @@ session, physical phone): the multi-output laser overlay, the
 transport-agnostic command core, token pairing over WebSocket, the
 clicker, the gyroscope laser (direction and sensitivity calibrated
 on-device), monitor confinement, the slide-notes editor, and the app's
-green UI with its own launcher icon.
+neutral UI with its own launcher icon.
 
 Deliberately not there yet: auto-reconnect and wake lock in the app, a
 desktop configuration file, packaging, and a systemd unit.
 
 ## Releases & updates
 
-The app and the desktop share one version (currently **0.1.0**, shown
+The app and the desktop share one version (currently **0.1.3**, shown
 at the bottom of the app's start screen). Releases live on GitHub: each
 one carries the arm64 app as a single APK asset named
 **`hyprpresenter-arm64.apk`** (the name is contractual — the update
-checker looks for exactly it). Download it, open it, and Android
-installs it over the previous version.
+checker looks for exactly it) plus the desktop tarball. Every release
+build is signed with the project's permanent key, so updates install
+over the previous version.
 
 The app checks for updates itself: at start-up, and any time via
 **Check for updates** under the version label, it asks the GitHub
 Releases API for the latest release, compares its tag (`vX.Y.Z`) with
 the installed version, and — when a newer one exists — shows an
-**Update to vX.Y.Z** button that opens the APK download in the browser.
+**Update to vX.Y.Z** button that downloads the APK inside the app and
+hands it to Android's installer; no browser is involved. The very
+first in-app update needs one Android permission (allow installs from
+HyprPresenter), which the app walks you to.
 
 ## Development
 
