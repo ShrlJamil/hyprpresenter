@@ -36,6 +36,15 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match pubspec version $APP_VERSION" >&2
             exit 1
           fi
+      - name: Restore the release signing key
+        working-directory: mobile/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+          printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=hyprpresenter\nstoreFile=%s\n' "$KEYSTORE_PASSWORD" "$KEY_PASSWORD" "$GITHUB_WORKSPACE/mobile/android/release.keystore" > key.properties
       - name: Build the release APK
         working-directory: mobile
         run: |
