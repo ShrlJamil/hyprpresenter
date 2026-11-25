@@ -32,13 +32,14 @@ as numbered cards, ready to review and trim before the talk.
 Grab the two files from the
 [latest release](https://github.com/ShrlJamil/hyprpresenter/releases/latest):
 
-- **Desktop:** `hypresent-linux-x86_64.tar.gz` — unpack it and put the
-  `hypresent` binary somewhere on your `PATH`:
+- **Desktop:** `hypresent-linux-x86_64.tar.gz` — unpack it and run
+  its installer, which copies the `hypresent` binary into
+  `~/.local/bin`:
 
   ```sh
   tar -xzf hypresent-linux-x86_64.tar.gz
-  mkdir -p ~/.local/bin
-  cp hypresent/hypresent ~/.local/bin/
+  cd hypresent
+  ./install.sh
   ```
 
 - **Phone:** `hyprpresenter-arm64.apk` — copy it to the phone, open

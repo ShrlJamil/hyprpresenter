@@ -81,6 +81,8 @@ jobs:
           mkdir -p dist/hypresent
           cp target/release/hypresent dist/hypresent/
           cp README.md LICENSE dist/hypresent/
+          cp packaging/tarball-install.sh dist/hypresent/install.sh
+          chmod +x dist/hypresent/install.sh
           tar -C dist -czf hypresent-linux-x86_64.tar.gz hypresent
       - uses: actions/upload-artifact@v4
         with:
@@ -104,8 +106,8 @@ jobs:
             ## Install
 
             **Desktop (Hyprland):** download `hypresent-linux-x86_64.tar.gz`,
-            extract it, and put the `hypresent` binary somewhere on your PATH,
-            or build from source with `./install.sh`.
+            extract it, `cd hypresent`, and run `./install.sh` — it copies
+            the binary into `~/.local/bin`. Or build from source (see the README).
 
             **Android:** download `hyprpresenter-arm64.apk` and install it.
             The app checks this page for future updates itself.
