@@ -6,7 +6,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
+
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'desktop_status.dart';
@@ -17,6 +17,7 @@ import 'pairing.dart';
 import 'presenter_connection.dart';
 import 'qr_scan_screen.dart';
 import 'update_check.dart';
+import 'update_install.dart';
 
 /// HyprPresenter mobile remote (Phase 6).
 ///
@@ -140,6 +141,7 @@ class _PairingGateState extends State<PairingGate> {
   /// A newer release found by the update checker, if any.
   UpdateInfo? _update;
   bool _checkingUpdate = false;
+  bool _updating = false;
   PairingValues? _stored;
   String? _error;
 
@@ -216,10 +218,95 @@ class _PairingGateState extends State<PairingGate> {
     }
   }
 
+  /// Download the pending update inside the app and hand it to the
+  /// system installer.  The first time, Android needs the user to
+  /// allow installs from this app; explain that and open the setting,
+  /// after which tapping Update again proceeds.
   Future<void> _openUpdate() async {
-    final url = _update?.downloadUrl;
-    if (url == null) return;
-    await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    final update = _update;
+    if (update == null || _updating) return;
+    if (!await UpdateInstaller.canInstallPackages()) {
+      if (!mounted) return;
+      final open = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Allow app installs'),
+          content: const Text(
+            'Android needs your permission once before HyprPresenter '
+            'can install its own updates. Open Settings, allow installs '
+            'from this app, then come back and tap Update again.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Not now'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Open Settings'),
+            ),
+          ],
+        ),
+      );
+      if (open == true) {
+        await UpdateInstaller.openInstallPermissionSettings();
+      }
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _updating = true);
+    final progress = ValueNotifier<double?>(null);
+    var dialogUp = true;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Text('Downloading v${update.version}'),
+        content: ValueListenableBuilder<double?>(
+          valueListenable: progress,
+          builder: (_, value, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              LinearProgressIndicator(value: value),
+              const SizedBox(height: 12),
+              Text(
+                value == null
+                    ? 'Downloading...'
+                    : '${(value * 100).round()}%',
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    try {
+      final file = await downloadUpdateApk(
+        update,
+        onProgress: (received, total) {
+          if (total != null && total > 0) {
+            progress.value = received / total;
+          }
+        },
+      );
+      if (!mounted) return;
+      if (dialogUp) {
+        dialogUp = false;
+        Navigator.of(context).pop();
+      }
+      await UpdateInstaller.installApk(file.path);
+    } catch (_) {
+      if (!mounted) return;
+      if (dialogUp) {
+        dialogUp = false;
+        Navigator.of(context).pop();
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Couldn't download the update")),
+      );
+    } finally {
+      progress.dispose();
+      if (mounted) setState(() => _updating = false);
+    }
   }
 
   Future<void> _boot() async {
@@ -310,7 +397,7 @@ class _PairingGateState extends State<PairingGate> {
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
                 child: FilledButton.tonalIcon(
-                  onPressed: _openUpdate,
+                  onPressed: _updating ? null : _openUpdate,
                   icon: const Icon(Icons.download, size: 18),
                   label: Text('Update to v${_update!.version}'),
                 ),

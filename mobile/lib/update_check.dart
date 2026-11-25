@@ -6,8 +6,8 @@
 ///   2. Compare it with this build's version from `package_info_plus`
 ///      (the pubspec `version:` — shown on the start screen).
 ///   3. If newer, the start screen offers the release's [apkAssetName]
-///      asset; tapping it opens the download in the browser, and the
-///      user installs the APK from there.
+///      asset; tapping it downloads the APK inside the app and hands
+///      it to the system installer (see update_install.dart).
 ///
 /// The asset name is contractual: every GitHub release must attach the
 /// arm64 APK under exactly this file name.
